@@ -127,6 +127,50 @@ async def get_summoner_rank(region, riot_id):
 
     return None
 
+async def get_flex_rank(region, riot_id):
+    """Get summoner's Flex queue rank using Riot ID format (GameName#TAG)"""
+    if "#" not in riot_id:
+        print(f"Invalid Riot ID format: {riot_id}")
+        return None
+    
+    game_name, tag_line = riot_id.split("#", 1)
+    
+    async with aiohttp.ClientSession() as session:
+        # First, get the account to get the PUUID
+        account_data = await get_account_by_riot_id(game_name, tag_line)
+        if not account_data:
+            print(f"Could not find account for {riot_id}")
+            return None
+        
+        puuid = account_data["puuid"]
+        
+        # Get summoner data using PUUID
+        summoner_data = await get_summoner_by_puuid(region, puuid)
+        if not summoner_data:
+            print(f"Could not find summoner data for {riot_id}")
+            return None
+        
+        summoner_id = summoner_data["id"]
+        
+        # Get rank data
+        rank_url = f"https://{region}.api.riotgames.com/lol/league/v4/entries/by-summoner/{summoner_id}"
+        headers = {"X-Riot-Token": RIOT_API_KEY}
+        
+        ranks = await fetch_json(session, rank_url, headers)
+        if not ranks:
+            return None
+            
+        # Look for Flex queue rank
+        for queue in ranks:
+            if queue["queueType"] == "RANKED_FLEX_SR":
+                return {
+                    "tier": queue["tier"],
+                    "rank": queue["rank"],
+                    "lp": queue["leaguePoints"]
+                }
+
+    return None
+
 async def get_match_history(region, riot_id, count=10):
     """Get recent match history for a player using Riot ID format (GameName#TAG), only Ranked Solo/Duo games (queueId 420)"""
     if "#" not in riot_id:

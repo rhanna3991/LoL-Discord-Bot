@@ -65,6 +65,15 @@ async def init_db():
             )
         ''')
 
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS discord_riot_mapping (
+                guild_id TEXT,
+                discord_id TEXT,
+                riot_id TEXT,
+                PRIMARY KEY (guild_id, discord_id)
+            )
+        ''')
+
         await conn.commit()
 
 async def add_tracked_player(guild_id, summoner_name, region):
@@ -212,3 +221,55 @@ async def get_notification_channel(guild_id):
         ''', (guild_id,)) as cursor:
             result = await cursor.fetchone()
             return result[0] if result else None
+
+async def link_discord_riot(guild_id, discord_id, riot_id):
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        # Verify the Riot ID exists in tracked_players
+        async with conn.execute('''
+            SELECT summoner_name FROM tracked_players
+            WHERE guild_id = ? AND LOWER(summoner_name) = LOWER(?)
+        ''', (guild_id, riot_id)) as cursor:
+            if not await cursor.fetchone():
+                raise ValueError(f"Riot ID {riot_id} is not being tracked in this server.")
+
+        # Store the mapping
+        await conn.execute('''
+            INSERT OR REPLACE INTO discord_riot_mapping (guild_id, discord_id, riot_id)
+            VALUES (?, ?, ?)
+        ''', (guild_id, discord_id, riot_id))
+        await conn.commit()
+
+async def get_riot_id_for_discord(guild_id, discord_id):
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        async with conn.execute('''
+            SELECT riot_id FROM discord_riot_mapping
+            WHERE guild_id = ? AND discord_id = ?
+        ''', (guild_id, discord_id)) as cursor:
+            result = await cursor.fetchone()
+            return result[0] if result else None
+
+async def get_discord_id_for_riot(guild_id, riot_id):
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        async with conn.execute('''
+            SELECT discord_id FROM discord_riot_mapping
+            WHERE guild_id = ? AND LOWER(riot_id) = LOWER(?)
+        ''', (guild_id, riot_id)) as cursor:
+            result = await cursor.fetchone()
+            return result[0] if result else None
+
+async def get_all_mapped_players(guild_id):
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        async with conn.execute(
+            "SELECT discord_id, riot_id FROM discord_riot_mapping WHERE guild_id = ?",
+            (guild_id,)
+        ) as cursor:
+            return await cursor.fetchall()
+
+async def unlink_discord_riot(guild_id, discord_id):
+    """Unlink a Discord account from its Riot ID mapping."""
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        await conn.execute(
+            "DELETE FROM discord_riot_mapping WHERE guild_id = ? AND discord_id = ?",
+            (guild_id, discord_id)
+        )
+        await conn.commit()

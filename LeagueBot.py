@@ -2,8 +2,9 @@ import os
 from dotenv import load_dotenv
 import discord
 from discord.ext import commands
-from db import init_db, add_tracked_player, get_tracked_players, remove_tracked_player, is_tiltcheck_enabled, toggle_tiltcheck, get_tiltcheck_cooldown, update_tiltcheck_cooldown, get_winstreak_cooldown, update_winstreak_cooldown, is_wincheck_enabled, toggle_wincheck, set_notification_channel, get_notification_channel
-from riot_api import get_account_by_riot_id, get_summoner_rank, get_match_history, get_detailed_match_history, get_champion_mastery, get_specific_champion_mastery, get_last_played_games, get_role_summary
+from discord import app_commands
+from db import init_db, add_tracked_player, get_tracked_players, remove_tracked_player, is_tiltcheck_enabled, toggle_tiltcheck, get_tiltcheck_cooldown, update_tiltcheck_cooldown, get_winstreak_cooldown, update_winstreak_cooldown, is_wincheck_enabled, toggle_wincheck, set_notification_channel, get_notification_channel, link_discord_riot, get_riot_id_for_discord, get_all_mapped_players, get_discord_id_for_riot, unlink_discord_riot
+from riot_api import get_account_by_riot_id, get_summoner_rank, get_flex_rank, get_match_history, get_detailed_match_history, get_champion_mastery, get_specific_champion_mastery, get_last_played_games, get_role_summary
 import asyncio
 from datetime import datetime
 from discord.ui import View, Button
@@ -75,12 +76,21 @@ class RefreshView(View):
     async def refresh_button(self, interaction: discord.Interaction, button: Button):
         await interaction.response.defer()
         
+        # Disable the button
+        button.disabled = True
+        await interaction.message.edit(view=self)
+        
         try:
             updated_embed = await self.generate_embed_func()
             await interaction.message.edit(embed=updated_embed, view=self)
         except Exception as e:
             print(f"Error refreshing leaderboard: {e}")
             await interaction.followup.send("Error refreshing leaderboard. Please try again.", ephemeral=True)
+        
+        # Wait 5 seconds before re-enabling the button
+        await asyncio.sleep(300)
+        button.disabled = False
+        await interaction.message.edit(view=self)
 
     async def on_timeout(self):
         for item in self.children:
@@ -124,7 +134,9 @@ async def help(interaction: discord.Interaction):
             "`/leaderboard` — View your server's leaderboard\n"
             "`/strongest` — Display an image of the "'Strongest'"\n"
             "`/rank` — Check a player's current rank\n"
-            "`/lastplayed` — Check when a player last played"
+            "`/lastplayed` — Check when a player last played\n"
+            "`/link` — Link a discord account to a Riot ID\n"
+            "`/unlink` — Unlink a discord account from a Riot ID"
         ),
         inline=False
     )
@@ -142,8 +154,11 @@ async def help(interaction: discord.Interaction):
     )
 
     embed.add_field(
-        name="🧠 Champion Mastery",
-        value="`/mastery` — View champion mastery for a player",
+        name="🧠 Miscellaneous",
+        value=(
+            "`/mastery` — View champion mastery for a player\n"
+            "`/lfg` — Notifies other players that you're looking for a game"
+        ),
         inline=False
     )
 
@@ -1410,6 +1425,188 @@ async def check_strongest():
                 except Exception as e:
                     print(f"Error posting strongest update: {e}")
                     continue
+
+@bot.tree.command(name="link", description="Link a Discord account to a Riot ID for duo notifications.")
+async def link(interaction: discord.Interaction, riot_id: str, discord_user: discord.Member = None):
+    await interaction.response.defer(ephemeral=True)
+
+    if "#" not in riot_id:
+        await interaction.followup.send("Invalid Riot ID. Use the format SummonerName#TAG")
+        return
+
+    # If no discord_user specified, use the command caller
+    target_user = discord_user or interaction.user
+
+    try:
+        # Check if the Riot ID is already linked to any Discord account
+        existing_discord_id = await get_discord_id_for_riot(str(interaction.guild.id), riot_id)
+        if existing_discord_id:
+            await interaction.followup.send(f"Riot ID **{riot_id}** is already linked to <@{existing_discord_id}>")
+            return
+
+        # Check if the Discord user already has a Riot ID linked
+        existing_riot_id = await get_riot_id_for_discord(str(interaction.guild.id), str(target_user.id))
+        if existing_riot_id:
+            await interaction.followup.send(f"<@{target_user.id}> is already linked to **{existing_riot_id}**")
+            return
+
+        await link_discord_riot(str(interaction.guild.id), str(target_user.id), riot_id)
+        
+        if target_user.id == interaction.user.id:
+            await interaction.followup.send(f"Successfully linked your Discord account to **{riot_id}**!")
+        else:
+            await interaction.followup.send(f"Successfully linked {target_user.mention}'s Discord account to **{riot_id}**!")
+    except ValueError as e:
+        await interaction.followup.send(str(e))
+    except Exception as e:
+        await interaction.followup.send(f"Failed to link account: {e}")
+
+@bot.tree.command(name="unlink", description="Unlink a Discord account from its Riot ID.")
+async def unlink(interaction: discord.Interaction, discord_user: discord.Member = None):
+    await interaction.response.defer(ephemeral=True)
+
+    # If no discord_user specified, use the command caller
+    target_user = discord_user or interaction.user
+
+    try:
+        # Check if the user has a Riot ID linked
+        riot_id = await get_riot_id_for_discord(str(interaction.guild.id), str(target_user.id))
+        if not riot_id:
+            await interaction.followup.send(f"<@{target_user.id}> doesn't have a Riot ID linked.")
+            return
+
+        # Unlink the account
+        await unlink_discord_riot(str(interaction.guild.id), str(target_user.id))
+        
+        if target_user.id == interaction.user.id:
+            await interaction.followup.send(f"Successfully unlinked your Discord account from **{riot_id}**!")
+        else:
+            await interaction.followup.send(f"Successfully unlinked {target_user.mention}'s Discord account from **{riot_id}**!")
+    except Exception as e:
+        await interaction.followup.send(f"Failed to unlink account: {e}")
+
+@bot.tree.command(name="lfg", description="Notifies other players that you're looking for a game.")
+@app_commands.choices(queue_type=[
+    app_commands.Choice(name="Ranked Solo/Duo", value="ranked"),
+    app_commands.Choice(name="Ranked Flex", value="flex"),
+    app_commands.Choice(name="Unranked", value="unranked")
+])
+async def lfg(interaction: discord.Interaction, queue_type: app_commands.Choice[str]):
+    await interaction.response.defer()
+
+    # Get the caller's Riot ID from the mapping
+    caller_riot_id = await get_riot_id_for_discord(str(interaction.guild.id), str(interaction.user.id))
+    if not caller_riot_id:
+        await interaction.followup.send("You need to link your Discord account to a Riot ID first. Use `/link` to set this up.", ephemeral=True)
+        return
+
+    # Get all other mapped users from the leaderboard
+    mapped_users = await get_all_mapped_players(str(interaction.guild.id))
+    mapped_users = [(discord_id, riot_id) for discord_id, riot_id in mapped_users if discord_id != str(interaction.user.id)]
+
+    if not mapped_users:
+        await interaction.followup.send("No other mapped players found to notify.", ephemeral=True)
+        return
+
+    # Get caller's rank based on queue type
+    caller_rank = None
+    if queue_type.value != "unranked":
+        if queue_type.value == "ranked":
+            caller_rank = await get_summoner_rank(DEFAULT_REGION, caller_riot_id)
+        else:  # flex
+            caller_rank = await get_flex_rank(DEFAULT_REGION, caller_riot_id)
+            
+        if not caller_rank:
+            await interaction.followup.send(f"You need to be ranked in {queue_type.name} to use this feature.", ephemeral=True)
+            return
+
+    # Filter users based on queue type and rank restrictions
+    eligible_users = []
+    for discord_id, riot_id in mapped_users:
+        if queue_type.value == "unranked":
+            eligible_users.append((discord_id, riot_id))
+            continue
+
+        # Get user's rank based on queue type
+        if queue_type.value == "ranked":
+            user_rank = await get_summoner_rank(DEFAULT_REGION, riot_id)
+        else:  # flex
+            user_rank = await get_flex_rank(DEFAULT_REGION, riot_id)
+            
+        if not user_rank:
+            continue
+
+        # Define rank tiers and their values (no Emerald)
+        rank_tiers = {
+            "IRON": 1, "BRONZE": 2, "SILVER": 3, "GOLD": 4,
+            "PLATINUM": 5, "DIAMOND": 6, "MASTER": 7,
+            "GRANDMASTER": 8, "CHALLENGER": 9
+        }
+        div_map = {"I": 1, "II": 2, "III": 3, "IV": 4}
+        
+        caller_tier = rank_tiers.get(caller_rank["tier"], 0)
+        user_tier = rank_tiers.get(user_rank["tier"], 0)
+        can_duo = False
+
+        if queue_type.value == "ranked":
+            # Grandmaster/Challenger: no duo allowed
+            if caller_tier >= 8 or user_tier >= 8:
+                can_duo = False
+            # Master: only with Diamond I or other Master
+            elif caller_tier == 7 or user_tier == 7:
+                if caller_tier == 7 and user_tier == 6 and user_rank["rank"] == "I":
+                    can_duo = True
+                elif user_tier == 7 and caller_tier == 6 and caller_rank["rank"] == "I":
+                    can_duo = True
+                elif caller_tier == 7 and user_tier == 7:
+                    can_duo = True
+            # Diamond: both must be Diamond, within two divisions
+            elif caller_tier == 6 or user_tier == 6:
+                if caller_tier == user_tier == 6:
+                    caller_div = div_map.get(caller_rank["rank"], 4)
+                    user_div = div_map.get(user_rank["rank"], 4)
+                    can_duo = abs(caller_div - user_div) <= 2
+            # Iron: can duo up to two tiers above
+            elif caller_tier == 1 or user_tier == 1:
+                can_duo = abs(caller_tier - user_tier) <= 2
+            # Bronze–Platinum: within one tier
+            elif caller_tier < 6 and user_tier < 6:
+                can_duo = abs(caller_tier - user_tier) <= 1
+
+        elif queue_type.value == "flex":
+            # Master+ must both be at least Platinum (tier 5)
+            if caller_tier >= 7 or user_tier >= 7:
+                can_duo = caller_tier >= 5 and user_tier >= 5
+            else:
+                can_duo = True
+
+        if can_duo:
+            eligible_users.append((discord_id, riot_id))
+
+    if not eligible_users:
+        await interaction.followup.send("Sorry! You're either too garbage or godlike to duo with someone in this server.", ephemeral=True)
+        return
+
+    # Create the notification message
+    queue_display = {
+        "ranked": "Ranked Solo/Duo",
+        "flex": "Ranked Flex",
+        "unranked": "an unranked gamemode"
+    }[queue_type.value]
+
+    notification = f"**{interaction.user.mention}** ({caller_riot_id}) is looking for someone to play with in {queue_display}!\n\n Notice to all eligible summoners:"
+    for discord_id, riot_id in eligible_users:
+        notification += f"\n• <@{discord_id}> ({riot_id})"
+
+    try:
+        # Send the image and notification
+        file = discord.File('DuoCheck.png', filename='DuoCheck.png')
+        await interaction.followup.send(content=notification, file=file)
+    except FileNotFoundError:
+        await interaction.followup.send("⚠️ DuoCheck.png image not found. Please add it to the bot directory.")
+    except Exception as e:
+        print(f"Error sending duo check: {e}")
+        await interaction.followup.send("Error sending duo check notification. Please try again.", ephemeral=True)
 
 @bot.event
 async def on_ready():
