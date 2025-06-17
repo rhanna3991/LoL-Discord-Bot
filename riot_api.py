@@ -3,12 +3,62 @@ import aiohttp
 import asyncio
 from dotenv import load_dotenv
 from functools import lru_cache
+import json
+import aiosqlite
+import time
+from collections import defaultdict
 
 load_dotenv()
 RIOT_API_KEY = os.getenv("RIOT_API_KEY")
 
+# Cache configurations
 match_cache = {}
+match_history_cache = {}
+puuid_cache = {}
+
+# TTL configurations
+MATCH_DATA_TTL = 32400  # 9 hours in seconds
+MATCH_HISTORY_TTL = 600  # 10 minutes in seconds
+
+# Rate limiting and metrics
 rate_limit_lock = asyncio.Semaphore(20)  # allow 20 concurrent requests safely
+cache_metrics = {
+    "match_cache_hits": 0,
+    "match_cache_misses": 0,
+    "match_history_cache_hits": 0,
+    "match_history_cache_misses": 0,
+    "puuid_cache_hits": 0,
+    "puuid_cache_misses": 0
+}
+
+# Global session
+_session = None
+
+async def get_session():
+    global _session
+    if _session is None:
+        _session = aiohttp.ClientSession()
+    return _session
+
+async def close_session():
+    global _session
+    if _session:
+        await _session.close()
+        _session = None
+
+# Replace the old fetch_json with this version
+async def fetch_json(url, headers):
+    session = await get_session()
+    async with session.get(url, headers=headers) as response:
+        if response.status == 429:
+            retry_after = int(response.headers.get('Retry-After', 10))
+            await asyncio.sleep(retry_after)
+            return await fetch_json(url, headers)
+        return await response.json() if response.status == 200 else None
+
+# Add shutdown handler to LeagueBot's on_ready
+async def cleanup():
+    await close_session()
 
 async def safe_request(session, url, headers, retries=3):
     for attempt in range(retries):
@@ -25,20 +75,113 @@ async def safe_request(session, url, headers, retries=3):
                     return None
     return None
 
-async def fetch_json(session, url, headers):
-    return await safe_request(session, url, headers)
+async def ensure_puuid_table():
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS puuid_cache (
+                riot_id TEXT PRIMARY KEY,
+                puuid TEXT,
+                cached_at INTEGER
+            )
+        ''')
+        await conn.commit()
+
+async def get_puuid_from_db(riot_id):
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        async with conn.execute(
+            "SELECT puuid FROM puuid_cache WHERE riot_id = ?",
+            (riot_id.lower(),)
+        ) as cursor:
+            result = await cursor.fetchone()
+            return result[0] if result else None
+
+async def save_puuid_to_db(riot_id, puuid):
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        await conn.execute(
+            "INSERT OR REPLACE INTO puuid_cache (riot_id, puuid, cached_at) VALUES (?, ?, ?)",
+            (riot_id.lower(), puuid, int(time.time()))
+        )
+        await conn.commit()
+
+async def batch_fetch_puuids(riot_ids):
+    """Fetch multiple PUUIDs in batch, using cache where possible"""
+    to_fetch = []
+    results = {}
+    
+    # Check cache first
+    for riot_id in riot_ids:
+        cached = await get_puuid_from_db(riot_id)
+        if cached:
+            results[riot_id] = cached
+        else:
+            to_fetch.append(riot_id)
+    
+    # Fetch missing PUUIDs in chunks
+    chunk_size = 10  # Adjust based on rate limits
+    for i in range(0, len(to_fetch), chunk_size):
+        chunk = to_fetch[i:i + chunk_size]
+        tasks = []
+        for riot_id in chunk:
+            if "#" not in riot_id:
+                continue
+            game_name, tag_line = riot_id.split("#", 1)
+            task = get_account_by_riot_id(game_name, tag_line)
+            tasks.append(task)
+        
+        chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for riot_id, result in zip(chunk, chunk_results):
+            if isinstance(result, Exception) or not result:
+                continue
+            puuid = result.get("puuid")
+            if puuid:
+                results[riot_id] = puuid
+                await save_puuid_to_db(riot_id, puuid)
+        
+        await asyncio.sleep(1)  # Rate limit compliance
+    
+    return results
+
+async def prefetch_puuids():
+    """Pre-fetch PUUIDs for all tracked players across all guilds"""
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        async with conn.execute("SELECT DISTINCT summoner_name FROM tracked_players") as cursor:
+            players = await cursor.fetchall()
+            riot_ids = [player[0] for player in players]
+    
+    if not riot_ids:
+        return
+    
+    print(f"Pre-fetching PUUIDs for {len(riot_ids)} players...")
+    results = await batch_fetch_puuids(riot_ids)
+    print(f"Successfully cached {len(results)} PUUIDs")
+
+# Update get_puuid to use the batch system for single lookups
+async def get_puuid(riot_id):
+    # Check memory cache first
+    if riot_id in puuid_cache:
+        return puuid_cache[riot_id]
+    
+    # Check database cache
+    db_puuid = await get_puuid_from_db(riot_id)
+    if db_puuid:
+        puuid_cache[riot_id] = db_puuid
+        return db_puuid
+    
+    # Fetch single PUUID using batch system
+    results = await batch_fetch_puuids([riot_id])
+    return results.get(riot_id)
 
 async def get_account_by_riot_id(game_name, tag_line):
-    async with aiohttp.ClientSession() as session:
-        url = f"https://americas.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
-        headers = {"X-Riot-Token": RIOT_API_KEY}
-        return await fetch_json(session, url, headers)
+    headers = {"X-Riot-Token": RIOT_API_KEY}
+    url = f"https://americas.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
+    return await fetch_json(url, headers)
 
 async def get_summoner_by_puuid(region, puuid):
     async with aiohttp.ClientSession() as session:
         url = f"https://{region}.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/{puuid}"
         headers = {"X-Riot-Token": RIOT_API_KEY}
-        return await fetch_json(session, url, headers)
+        return await fetch_json(url, headers)
 
 _champion_data_cache = None
 
@@ -49,11 +192,11 @@ async def get_champion_data():
 
     async with aiohttp.ClientSession() as session:
         version_url = "https://ddragon.leagueoflegends.com/api/versions.json"
-        version_response = await fetch_json(session, version_url, {})
+        version_response = await fetch_json(version_url, {})
         version = version_response[0] if version_response else "14.24.1"
 
         champ_data_url = f"https://ddragon.leagueoflegends.com/cdn/{version}/data/en_US/champion.json"
-        champ_data = await fetch_json(session, champ_data_url, {})
+        champ_data = await fetch_json(champ_data_url, {})
 
         id_to_name = {}
         name_to_id = {}
@@ -65,57 +208,82 @@ async def get_champion_data():
         _champion_data_cache = (id_to_name, name_to_id)
         return _champion_data_cache
 
+# Persistent match data cache using SQLite
+async def get_match_data_local(match_id):
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        async with conn.execute("SELECT data, cached_at FROM match_data WHERE match_id = ?", (match_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                data, cached_at = row
+                if time.time() - cached_at < MATCH_DATA_TTL:
+                    return json.loads(data)
+    return None
+
+async def save_match_data_local(match_id, data):
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        await conn.execute(
+            "INSERT OR REPLACE INTO match_data (match_id, data, cached_at) VALUES (?, ?, ?)",
+            (match_id, json.dumps(data), int(time.time()))
+        )
+        await conn.commit()
+
+# Ensure table exists at startup
+async def ensure_match_data_table():
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS match_data (
+                match_id TEXT PRIMARY KEY,
+                data TEXT,
+                cached_at INTEGER
+            )
+        ''')
+        await conn.commit()
+
+# Update get_cached_match_data to use persistent cache
 async def get_cached_match_data(session, match_id):
+    # 1. Try in-memory cache
     if match_id in match_cache:
         return match_cache[match_id]
+    # 2. Try persistent cache
+    match_data = await get_match_data_local(match_id)
+    if match_data:
+        match_cache[match_id] = match_data
+        return match_data
+    # 3. Fetch from Riot API
     data = await get_match_data(session, match_id)
     if data:
         match_cache[match_id] = data
+        await save_match_data_local(match_id, data)
     return data
 
 async def get_match_data(session, match_id):
     url = f"https://americas.api.riotgames.com/lol/match/v5/matches/{match_id}"
     headers = {"X-Riot-Token": RIOT_API_KEY}
-    return await fetch_json(session, url, headers)
+    return await fetch_json(url, headers)
 
 async def get_match_timeline(session, match_id):
     url = f"https://americas.api.riotgames.com/lol/match/v5/matches/{match_id}/timeline"
     headers = {"X-Riot-Token": RIOT_API_KEY}
-    return await fetch_json(session, url, headers)
+    return await fetch_json(url, headers)
 
 async def get_summoner_rank(region, riot_id):
     """Get summoner rank using Riot ID format (GameName#TAG)"""
-    if "#" not in riot_id:
-        print(f"Invalid Riot ID format: {riot_id}")
+    puuid = await get_puuid(riot_id)
+    if not puuid:
         return None
-    
-    game_name, tag_line = riot_id.split("#", 1)
-    
     async with aiohttp.ClientSession() as session:
-        # First, get the account to get the PUUID
-        account_data = await get_account_by_riot_id(game_name, tag_line)
-        if not account_data:
-            print(f"Could not find account for {riot_id}")
-            return None
-        
-        puuid = account_data["puuid"]
-        
         # Get summoner data using PUUID
         summoner_data = await get_summoner_by_puuid(region, puuid)
         if not summoner_data:
             print(f"Could not find summoner data for {riot_id}")
             return None
-        
         summoner_id = summoner_data["id"]
-        
         # Get rank data
         rank_url = f"https://{region}.api.riotgames.com/lol/league/v4/entries/by-summoner/{summoner_id}"
         headers = {"X-Riot-Token": RIOT_API_KEY}
-        
-        ranks = await fetch_json(session, rank_url, headers)
+        ranks = await fetch_json(rank_url, headers)
         if not ranks:
             return None
-            
         # Look for Solo/Duo queue rank
         for queue in ranks:
             if queue["queueType"] == "RANKED_SOLO_5x5":
@@ -124,42 +292,26 @@ async def get_summoner_rank(region, riot_id):
                     "rank": queue["rank"],
                     "lp": queue["leaguePoints"]
                 }
-
     return None
 
 async def get_flex_rank(region, riot_id):
     """Get summoner's Flex queue rank using Riot ID format (GameName#TAG)"""
-    if "#" not in riot_id:
-        print(f"Invalid Riot ID format: {riot_id}")
+    puuid = await get_puuid(riot_id)
+    if not puuid:
         return None
-    
-    game_name, tag_line = riot_id.split("#", 1)
-    
     async with aiohttp.ClientSession() as session:
-        # First, get the account to get the PUUID
-        account_data = await get_account_by_riot_id(game_name, tag_line)
-        if not account_data:
-            print(f"Could not find account for {riot_id}")
-            return None
-        
-        puuid = account_data["puuid"]
-        
         # Get summoner data using PUUID
         summoner_data = await get_summoner_by_puuid(region, puuid)
         if not summoner_data:
             print(f"Could not find summoner data for {riot_id}")
             return None
-        
         summoner_id = summoner_data["id"]
-        
         # Get rank data
         rank_url = f"https://{region}.api.riotgames.com/lol/league/v4/entries/by-summoner/{summoner_id}"
         headers = {"X-Riot-Token": RIOT_API_KEY}
-        
-        ranks = await fetch_json(session, rank_url, headers)
+        ranks = await fetch_json(rank_url, headers)
         if not ranks:
             return None
-            
         # Look for Flex queue rank
         for queue in ranks:
             if queue["queueType"] == "RANKED_FLEX_SR":
@@ -168,31 +320,35 @@ async def get_flex_rank(region, riot_id):
                     "rank": queue["rank"],
                     "lp": queue["leaguePoints"]
                 }
-
     return None
+
+async def get_cached_match_ids(session, puuid, count):
+    now = time.time()
+    key = (puuid, count)
+    
+    if key in match_history_cache:
+        match_ids, cached_time = match_history_cache[key]
+        if now - cached_time < MATCH_HISTORY_TTL:
+            cache_metrics["match_history_cache_hits"] += 1
+            return match_ids
+    
+    cache_metrics["match_history_cache_misses"] += 1
+    url = f"https://americas.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?start=0&count={count}"
+    headers = {"X-Riot-Token": RIOT_API_KEY}
+    match_ids = await fetch_json(url, headers)
+    
+    if match_ids:
+        match_history_cache[key] = (match_ids, now)
+    return match_ids
 
 async def get_match_history(region, riot_id, count=10):
     """Get recent match history for a player using Riot ID format (GameName#TAG), only Ranked Solo/Duo games (queueId 420)"""
-    if "#" not in riot_id:
-        print(f"Invalid Riot ID format: {riot_id}")
-        return None
-    
-    game_name, tag_line = riot_id.split("#", 1)
-    
     async with aiohttp.ClientSession() as session:
-        # First, get the account to get the PUUID
-        account_data = await get_account_by_riot_id(game_name, tag_line)
-        if not account_data:
-            print(f"Could not find account for {riot_id}")
+        puuid = await get_puuid(riot_id)
+        if not puuid:
             return None
-        
-        puuid = account_data["puuid"]
-        
-        # Get match history
-        match_history_url = f"https://americas.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?start=0&count=30"
-        headers = {"X-Riot-Token": RIOT_API_KEY}
-        
-        match_ids = await fetch_json(session, match_history_url, headers)
+
+        match_ids = await get_cached_match_ids(session, puuid, count * 2)  # Get more matches to account for filtering
         if not match_ids:
             return None
 
@@ -201,15 +357,15 @@ async def get_match_history(region, riot_id, count=10):
             match_data = await get_cached_match_data(session, match_id)
             if not match_data:
                 continue
-                
+
             # Only include Ranked Solo/Duo games (queueId 420)
             if match_data["info"].get("queueId") != 420:
                 continue
-                
+
             # Skip remakes (games that ended very early)
             if match_data["info"]["gameDuration"] < 180:  # 3 minutes in seconds
                 continue
-                
+
             # Find the player's data in the match
             for participant in match_data["info"]["participants"]:
                 if participant["puuid"] == puuid:
@@ -225,7 +381,7 @@ async def get_match_history(region, riot_id, count=10):
                         "timestamp": match_data["info"]["gameStartTimestamp"]
                     })
                     break
-                    
+
             # Stop if we've collected enough ranked games
             if len(matches) >= count:
                 break
@@ -234,26 +390,12 @@ async def get_match_history(region, riot_id, count=10):
 
 async def get_detailed_match_history(region, riot_id, count=20):
     """Get detailed match history including all stats needed for /stats and /feederscore commands"""
-    if "#" not in riot_id:
-        print(f"Invalid Riot ID format: {riot_id}")
-        return None
-    
-    game_name, tag_line = riot_id.split("#", 1)
-    
     async with aiohttp.ClientSession() as session:
-        # First, get the account to get the PUUID
-        account_data = await get_account_by_riot_id(game_name, tag_line)
-        if not account_data:
-            print(f"Could not find account for {riot_id}")
+        puuid = await get_puuid(riot_id)
+        if not puuid:
             return None
-        
-        puuid = account_data["puuid"]
-        
-        # Get match history
-        match_history_url = f"https://americas.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?start=0&count={count * 2}"
-        headers = {"X-Riot-Token": RIOT_API_KEY}
-        
-        match_ids = await fetch_json(session, match_history_url, headers)
+
+        match_ids = await get_cached_match_ids(session, puuid, count * 2)  # Get more matches to account for filtering
         if not match_ids:
             return None
 
@@ -262,11 +404,11 @@ async def get_detailed_match_history(region, riot_id, count=20):
             match_data = await get_cached_match_data(session, match_id)
             if not match_data:
                 continue
-                
+
             # Only include Ranked Solo/Duo games (queueId 420)
             if match_data["info"].get("queueId") != 420:
                 continue
-            
+
             # Find the player's data in the match
             player_data = None
             player_team_id = None
@@ -275,10 +417,9 @@ async def get_detailed_match_history(region, riot_id, count=20):
                     player_data = participant
                     player_team_id = participant["teamId"]
                     break
-            
             if not player_data:
                 continue
-            
+
             # Calculate team totals for percentage calculations
             team_kills = 0
             team_damage = 0
@@ -396,7 +537,7 @@ async def get_specific_champion_mastery(region, riot_id, champion_name):
         mastery_url = f"https://{region}.api.riotgames.com/lol/champion-mastery/v4/champion-masteries/by-puuid/{puuid}/by-champion/{champion_id}"
         headers = {"X-Riot-Token": RIOT_API_KEY}
         
-        mastery = await fetch_json(session, mastery_url, headers)
+        mastery = await fetch_json(mastery_url, headers)
         if not mastery:
             return None
         
@@ -429,7 +570,7 @@ async def get_champion_mastery(region, riot_id, count=10):
         mastery_url = f"https://{region}.api.riotgames.com/lol/champion-mastery/v4/champion-masteries/by-puuid/{puuid}/top?count={count}"
         headers = {"X-Riot-Token": RIOT_API_KEY}
         
-        masteries = await fetch_json(session, mastery_url, headers)
+        masteries = await fetch_json(mastery_url, headers)
         if not masteries:
             return None
         
@@ -471,7 +612,7 @@ async def get_last_played_games(region, riot_id):
         match_history_url = f"https://americas.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?start=0&count=50"
         headers = {"X-Riot-Token": RIOT_API_KEY}
         
-        match_ids = await fetch_json(session, match_history_url, headers)
+        match_ids = await fetch_json(match_history_url, headers)
         if not match_ids:
             return None
 
@@ -551,7 +692,7 @@ async def get_role_summary(region, riot_id, count=50):
         match_history_url = f"https://americas.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?start=0&count={min(count * 2, 100)}"
         headers = {"X-Riot-Token": RIOT_API_KEY}
         
-        match_ids = await fetch_json(session, match_history_url, headers)
+        match_ids = await fetch_json(match_history_url, headers)
         if not match_ids:
             return None
 
@@ -608,4 +749,41 @@ async def get_role_summary(region, riot_id, count=50):
             "role_data": role_display,
             "games_analyzed": games_analyzed
         }
+
+class GuildThrottler:
+    def __init__(self):
+        self.guild_last_check = defaultdict(float)
+        self.guild_player_counts = defaultdict(int)
+        
+    def get_delay(self, guild_id):
+        """Calculate delay based on guild's player count"""
+        player_count = self.guild_player_counts[guild_id]
+        if player_count > 100:
+            return 5.0  # 5 second delay for large guilds
+        elif player_count > 50:
+            return 3.0  # 3 second delay for medium guilds
+        elif player_count > 20:
+            return 1.0  # 1 second delay for small guilds
+        return 0.5     # 0.5 second delay for tiny guilds
+    
+    async def wait_for_guild(self, guild_id, player_count):
+        """Wait appropriate time based on guild size"""
+        self.guild_player_counts[guild_id] = player_count
+        now = time.time()
+        last_check = self.guild_last_check[guild_id]
+        delay = self.get_delay(guild_id)
+        
+        if now - last_check < delay:
+            await asyncio.sleep(delay - (now - last_check))
+        
+        self.guild_last_check[guild_id] = time.time()
+
+# Create global throttler instance
+guild_throttler = GuildThrottler()
+
+# Update the check_streaks function to use throttling
+async def check_streaks_for_guild(guild_id, players):
+    """Check streaks for a single guild with throttling"""
+    await guild_throttler.wait_for_guild(guild_id, len(players))
+    # ... rest of the streak checking logic ...
 

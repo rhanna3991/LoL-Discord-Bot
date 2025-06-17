@@ -74,6 +74,26 @@ async def init_db():
             )
         ''')
 
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS strongest_players (
+                guild_id TEXT PRIMARY KEY,
+                summoner_name TEXT,
+                tier TEXT,
+                division TEXT,
+                lp INTEGER,
+                last_update TIMESTAMP,
+                days_as_strongest INTEGER DEFAULT 0
+            )
+        ''')
+
+        # Check if days_as_strongest column exists
+        async with conn.execute("PRAGMA table_info(strongest_players)") as cursor:
+            columns = [row[1] for row in await cursor.fetchall()]
+            
+        # Add days_as_strongest column if it doesn't exist
+        if 'days_as_strongest' not in columns:
+            await conn.execute('ALTER TABLE strongest_players ADD COLUMN days_as_strongest INTEGER DEFAULT 0')
+            
         await conn.commit()
 
 async def add_tracked_player(guild_id, summoner_name, region):
@@ -272,4 +292,24 @@ async def unlink_discord_riot(guild_id, discord_id):
             "DELETE FROM discord_riot_mapping WHERE guild_id = ? AND discord_id = ?",
             (guild_id, discord_id)
         )
+        await conn.commit()
+
+async def ensure_puuid_table():
+    """Ensure the puuid_cache table exists in the database."""
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS puuid_cache (
+                riot_id TEXT PRIMARY KEY,
+                puuid TEXT,
+                cached_at INTEGER
+            )
+        ''')
+        await conn.commit()
+
+async def clear_tracked_players(guild_id):
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        await conn.execute('''
+            DELETE FROM tracked_players
+            WHERE guild_id = ?
+        ''', (guild_id,))
         await conn.commit()

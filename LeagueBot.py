@@ -3,8 +3,11 @@ from dotenv import load_dotenv
 import discord
 from discord.ext import commands
 from discord import app_commands
-from db import init_db, add_tracked_player, get_tracked_players, remove_tracked_player, is_tiltcheck_enabled, toggle_tiltcheck, get_tiltcheck_cooldown, update_tiltcheck_cooldown, get_winstreak_cooldown, update_winstreak_cooldown, is_wincheck_enabled, toggle_wincheck, set_notification_channel, get_notification_channel, link_discord_riot, get_riot_id_for_discord, get_all_mapped_players, get_discord_id_for_riot, unlink_discord_riot
-from riot_api import get_account_by_riot_id, get_summoner_rank, get_flex_rank, get_match_history, get_detailed_match_history, get_champion_mastery, get_specific_champion_mastery, get_last_played_games, get_role_summary
+from db import init_db, add_tracked_player, get_tracked_players, remove_tracked_player, is_tiltcheck_enabled, toggle_tiltcheck, get_tiltcheck_cooldown, update_tiltcheck_cooldown, get_winstreak_cooldown, update_winstreak_cooldown, is_wincheck_enabled, toggle_wincheck, set_notification_channel, get_notification_channel, link_discord_riot, get_riot_id_for_discord, get_all_mapped_players, get_discord_id_for_riot, unlink_discord_riot, clear_tracked_players
+from riot_api import (get_account_by_riot_id, get_summoner_rank, get_flex_rank, get_match_history, 
+                     get_detailed_match_history, get_champion_mastery, get_specific_champion_mastery, 
+                     get_last_played_games, get_role_summary, ensure_match_data_table, 
+                     ensure_puuid_table, cleanup, prefetch_puuids)
 import asyncio
 from datetime import datetime
 from discord.ui import View, Button
@@ -136,7 +139,8 @@ async def help(interaction: discord.Interaction):
             "`/rank` — Check a player's current rank\n"
             "`/lastplayed` — Check when a player last played\n"
             "`/link` — Link a discord account to a Riot ID\n"
-            "`/unlink` — Unlink a discord account from a Riot ID"
+            "`/unlink` — Unlink a discord account from a Riot ID\n"
+            "`/clear` — Clear and unlink all tracked players"
         ),
         inline=False
     )
@@ -211,16 +215,16 @@ async def add(interaction: discord.Interaction, riot_id: str):
         await interaction.followup.send(f"Failed to add summoner: {e}")
 
 @bot.tree.command(name="remove", description="Remove a player from the tracking list.")
-async def remove(interaction: discord.Interaction, summoner_name: str):
+async def remove(interaction: discord.Interaction, riot_id: str):
     await interaction.response.defer(ephemeral=True) # Defer ephemerally
 
-    if not summoner_name:
+    if not riot_id:
         await interaction.followup.send("You need to provide a summoner name to remove.")
         return
 
     try:
-        await remove_tracked_player(str(interaction.guild.id), summoner_name)
-        await interaction.followup.send(f"Removed **{summoner_name}** from tracking list.")
+        await remove_tracked_player(str(interaction.guild.id), riot_id)
+        await interaction.followup.send(f"Removed **{riot_id}** from tracking list.")
     except Exception as e:
         await interaction.followup.send(f"Failed to remove summoner: {e}")
 
@@ -318,15 +322,12 @@ async def leaderboard(interaction: discord.Interaction):
     message = await interaction.followup.send(embed=embed, view=view)
     view.message = message
 
-@bot.tree.command(name="strongest", description="Finds the strongest tracked player based on rank.")
-async def strongest(interaction: discord.Interaction):
-    await interaction.response.defer()
-
-    players = await get_tracked_players(str(interaction.guild.id))
+async def get_strongest_player(guild_id):
+    """Helper function to get the strongest player for a guild"""
+    players = await get_tracked_players(guild_id)
     
     if not players:
-        await interaction.followup.send("No summoners are currently being tracked for this server.")
-        return
+        return None
 
     rank_order = {
         "IRON": 1, "BRONZE": 2, "SILVER": 3, "GOLD": 4,
@@ -361,9 +362,61 @@ async def strongest(interaction: discord.Interaction):
                 }
 
     if not strongest_player:
-        await interaction.followup.send("Could not determine the strongest player (no rank data found).")
-        return
+        return None
 
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        # fetch existing row
+        async with conn.execute(
+            "SELECT summoner_name, tier, division, lp, days_as_strongest, last_update FROM strongest_players WHERE guild_id = ?",
+            (guild_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        current_time = datetime.utcnow()
+        is_new_strongest = False
+        
+        if not row:
+            days_as_strongest = 1
+            should_update = True
+            is_new_strongest = True
+        elif row[0] != strongest_player['name']:
+            days_as_strongest = 1
+            should_update = True
+            is_new_strongest = True
+        else:
+            # Check if a full day has passed since last update
+            last_update = datetime.fromisoformat(row[5].replace('Z', '+00:00'))
+            time_diff = current_time - last_update
+            
+            if time_diff.days >= 1:
+                days_as_strongest = row[4] + 1
+                should_update = True
+            else:
+                days_as_strongest = row[4]
+                should_update = False
+
+        if should_update:
+            # Update the database
+            await conn.execute('''
+                INSERT OR REPLACE INTO strongest_players
+                  (guild_id, summoner_name, tier, division, lp, last_update, days_as_strongest)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+            ''', (
+                guild_id,
+                strongest_player['name'],
+                strongest_player['tier'],
+                strongest_player['division'],
+                strongest_player['lp'],
+                days_as_strongest
+            ))
+            await conn.commit()
+
+        strongest_player['days_as_strongest'] = days_as_strongest
+        strongest_player['is_new_strongest'] = is_new_strongest
+        return strongest_player
+
+async def announce_strongest_player(channel, strongest_player):
+    """Helper function to announce the strongest player to a channel"""
     try:
         base_image = Image.open('TheStrongest.png')
         img = base_image.copy()
@@ -400,24 +453,72 @@ async def strongest(interaction: discord.Interaction):
         
         file = discord.File(img_bytes, filename='TheStrongest.png')
         
-    except FileNotFoundError:
-        await interaction.followup.send("⚠️ Template image not found. Please add 'strongest_template.png' to the bot directory.")
-        return
+        if strongest_player['tier'] in ["MASTER", "GRANDMASTER", "CHALLENGER"]:
+            rank_display = f"{strongest_player['tier']} - {strongest_player['lp']}LP"
+        else:
+            rank_display = f"{strongest_player['tier']} {strongest_player['division']} - {strongest_player['lp']}LP"
+        
+        # Calculate duration in a natural format
+        days = strongest_player['days_as_strongest']
+        if days >= 365:
+            years = days // 365
+            duration = f"{years} {'YEAR' if years == 1 else 'YEARS'}"
+        elif days >= 30:
+            months = days // 30
+            duration = f"{months} {'MONTH' if months == 1 else 'MONTHS'}"
+        else:
+            duration = f"{days} {'DAY' if days == 1 else 'DAYS'}"
+        
+        content = f"**🏆 THE STRONGEST HAS BEEN REIGNING FOR {duration} 🏆**\n{strongest_player['name']}     {rank_display}"
+        
+        await channel.send(content=content, file=file)
+        
     except Exception as e:
-        print(f"Error editing image: {e}")
-        file = None
+        print(f"Error posting strongest update: {e}")
 
-    if strongest_player['tier'] in ["MASTER", "GRANDMASTER", "CHALLENGER"]:
-        rank_display = f"{strongest_player['tier']} - {strongest_player['lp']}LP"
-    else:
-        rank_display = f"{strongest_player['tier']} {strongest_player['division']} - {strongest_player['lp']}LP"
+@tasks.loop(hours=6)
+async def check_strongest():
+    for guild in bot.guilds:
+        guild_id = str(guild.id)
+        strongest_player = await get_strongest_player(guild_id)
+        
+        if not strongest_player:
+            continue
+
+        # Only announce if there's a change in the strongest player
+        if not strongest_player.get('is_new_strongest', False):
+            continue
+
+        # Try to get the notification channel, fall back to general or first available channel
+        channel = None
+        channel_id = await get_notification_channel(guild_id)
+        if channel_id:
+            channel = bot.get_channel(int(channel_id))
+        
+        if not channel:
+            # Try to find general channel
+            channel = discord.utils.get(guild.text_channels, name="general")
+            
+        if not channel and guild.text_channels:
+            # If no general channel, use the first available text channel
+            channel = guild.text_channels[0]
+            
+        if not channel:
+            continue
+
+        await announce_strongest_player(channel, strongest_player)
+
+@bot.tree.command(name="strongest", description="Finds the strongest tracked player based on rank.")
+async def strongest(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    strongest_player = await get_strongest_player(str(interaction.guild.id))
     
-    content = f"**🏆  THE STRONGEST  🏆**\n{strongest_player['name']}     {rank_display}"
-    
-    if file:
-        await interaction.followup.send(content=content, file=file)
-    else:
-        await interaction.followup.send(content=content)
+    if not strongest_player:
+        await interaction.followup.send("No summoners are currently being tracked for this server.")
+        return
+
+    await announce_strongest_player(interaction.channel, strongest_player)
 
 @bot.tree.command(name="history", description="Show recent match history for a player.")
 async def history(interaction: discord.Interaction, riot_id: str, games: int = 10):
@@ -680,7 +781,7 @@ async def wincheck(interaction: discord.Interaction):
     status_msg = "enabled ✅" if enabled else "disabled ❌"
     await interaction.followup.send(f"Win streak alerts are now {status_msg}.")
 
-@tasks.loop(minutes=40)
+@tasks.loop(minutes=5)
 async def check_streaks():
     for guild in bot.guilds:
         guild_id = str(guild.id)
@@ -1256,176 +1357,6 @@ async def feederscore(interaction: discord.Interaction, riot_id: str, games: int
 
     await interaction.followup.send(embed=embed)
 
-@tasks.loop(hours=6)
-async def check_strongest():
-    for guild in bot.guilds:
-        guild_id = str(guild.id)
-        players = await get_tracked_players(guild_id)
-        
-        if not players:
-            continue
-
-        rank_order = {
-            "IRON": 1, "BRONZE": 2, "SILVER": 3, "GOLD": 4,
-            "PLATINUM": 5, "EMERALD": 6, "DIAMOND": 7,
-            "MASTER": 8, "GRANDMASTER": 9, "CHALLENGER": 10
-        }
-
-        strongest_player = None
-        highest_rank = (0, 0, 0)
-        
-        for summoner_name, region in players:
-            rank_data = await get_summoner_rank(region, summoner_name)
-            
-            if rank_data:
-                tier = rank_data["tier"]
-                division = rank_data["rank"]
-                lp = rank_data["lp"]
-                
-                if tier in ["MASTER", "GRANDMASTER", "CHALLENGER"]:
-                    sort_key = (rank_order[tier], 0, lp)
-                else:
-                    division_value = {"I": 1, "II": 2, "III": 3, "IV": 4}.get(division, 4)
-                    sort_key = (rank_order[tier], -division_value, lp)
-                
-                if sort_key > highest_rank:
-                    highest_rank = sort_key
-                    strongest_player = {
-                        'name': summoner_name,
-                        'tier': tier,
-                        'division': division,
-                        'lp': lp
-                    }
-
-        if not strongest_player:
-            continue
-
-        async with aiosqlite.connect("riot_bot.db") as conn:
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS strongest_players (
-                    guild_id TEXT PRIMARY KEY,
-                    summoner_name TEXT,
-                    tier TEXT,
-                    division TEXT,
-                    lp INTEGER,
-                    last_update TIMESTAMP
-                )
-            ''')
-            
-            # fetch existing row
-            async with conn.execute(
-                "SELECT summoner_name, tier, division, lp FROM strongest_players WHERE guild_id = ?",
-                (guild_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-
-            if not row:
-                # 1) First-time ever: insert & announce
-                announce = True
-
-            elif row[0] != strongest_player['name']:
-                # 2) New player on top: insert & announce
-                announce = True
-
-            elif (row[1] != strongest_player['tier'] or
-                  row[2] != strongest_player['division']):
-                # 3a) Same player, but tier/div changed: update & announce
-                announce = True
-
-            elif row[3] != strongest_player['lp']:
-                # 3b) Same player, same tier/div, only LP changed: update silently
-                announce = False
-
-            else:
-                # 3c) Nothing at all changed
-                continue  # skip everything
-
-            # Apply the database update (either INSERT OR REPLACE or UPDATE)
-            if announce:
-                await conn.execute('''
-                    INSERT OR REPLACE INTO strongest_players
-                      (guild_id, summoner_name, tier, division, lp, last_update)
-                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ''', (
-                    guild_id,
-                    strongest_player['name'],
-                    strongest_player['tier'],
-                    strongest_player['division'],
-                    strongest_player['lp']
-                ))
-            else:
-                await conn.execute('''
-                    UPDATE strongest_players
-                       SET tier = ?, division = ?, lp = ?, last_update = CURRENT_TIMESTAMP
-                     WHERE guild_id = ? AND summoner_name = ?
-                ''', (
-                    strongest_player['tier'],
-                    strongest_player['division'],
-                    strongest_player['lp'],
-                    guild_id,
-                    strongest_player['name']
-                ))
-            await conn.commit()
-
-            # Finally, send the announcement if we flagged announce == True
-            if announce:
-                channel_id = await get_notification_channel(guild_id)
-                if not channel_id:
-                    continue
-
-                channel = bot.get_channel(int(channel_id))
-                if not channel:
-                    continue
-
-                try:
-                    base_image = Image.open('TheStrongest.png')
-                    img = base_image.copy()
-                    draw = ImageDraw.Draw(img)
-                    
-                    try:
-                        font = ImageFont.truetype("MinecraftRegular-Bmg3.otf", 48)
-                    except:
-                        try:
-                            font = ImageFont.truetype(r"C:\Users\Sewde\Desktop\DiscordBot\MinecraftRegular-Bmg3.otf", 48)
-                        except:
-                            font = ImageFont.load_default()
-                    
-                    text = strongest_player['name']
-                    bbox = draw.textbbox((0, 0), text, font=font)
-                    text_width = bbox[2] - bbox[0]
-                    text_height = bbox[3] - bbox[1]
-                    
-                    img_width, img_height = img.size
-                    x = (img_width - text_width) // 2 - 625 
-                    y = img_height - 925
-                    
-                    outline_range = 2
-                    for adj_x in range(-outline_range, outline_range + 1):
-                        for adj_y in range(-outline_range, outline_range + 1):
-                            if adj_x != 0 or adj_y != 0:
-                                draw.text((x + adj_x, y + adj_y), text, font=font, fill='white')
-                    
-                    draw.text((x, y), text, font=font, fill='black')
-                    
-                    img_bytes = io.BytesIO()
-                    img.save(img_bytes, format='PNG')
-                    img_bytes.seek(0)
-                    
-                    file = discord.File(img_bytes, filename='TheStrongest.png')
-                    
-                    if strongest_player['tier'] in ["MASTER", "GRANDMASTER", "CHALLENGER"]:
-                        rank_display = f"{strongest_player['tier']} - {strongest_player['lp']}LP"
-                    else:
-                        rank_display = f"{strongest_player['tier']} {strongest_player['division']} - {strongest_player['lp']}LP"
-                    
-                    content = f"**🏆 THE STRONGEST OF TODAY 🏆**\n{strongest_player['name']}     {rank_display}"
-                    
-                    await channel.send(content=content, file=file)
-                    
-                except Exception as e:
-                    print(f"Error posting strongest update: {e}")
-                    continue
-
 @bot.tree.command(name="link", description="Link a Discord account to a Riot ID for duo notifications.")
 async def link(interaction: discord.Interaction, riot_id: str, discord_user: discord.Member = None):
     await interaction.response.defer(ephemeral=True)
@@ -1608,16 +1539,57 @@ async def lfg(interaction: discord.Interaction, queue_type: app_commands.Choice[
         print(f"Error sending duo check: {e}")
         await interaction.followup.send("Error sending duo check notification. Please try again.", ephemeral=True)
 
+@bot.tree.command(name="clear", description="Clears all tracked players from the leaderboard.")
+@app_commands.choices(confirm=[
+    app_commands.Choice(name="Yes", value="Y"),
+    app_commands.Choice(name="No", value="N")
+])
+async def clear(interaction: discord.Interaction, confirm: app_commands.Choice[str]):
+    await interaction.response.defer(ephemeral=True)
+    
+    if confirm.value == "N":
+        await interaction.followup.send("Leaderboard clear cancelled.")
+        return
+    
+    try:
+        # Get all mapped players before clearing
+        mapped_players = await get_all_mapped_players(str(interaction.guild.id))
+        
+        # Clear tracked players
+        await clear_tracked_players(str(interaction.guild.id))
+        
+        # Unlink all Discord-Riot ID mappings
+        for discord_id, _ in mapped_players:
+            await unlink_discord_riot(str(interaction.guild.id), discord_id)
+        
+        await interaction.followup.send("Successfully cleared all tracked players from the leaderboard and unlinked all Discord-Riot ID mappings.")
+    except Exception as e:
+        await interaction.followup.send(f"Failed to clear leaderboard: {e}")
+
 @bot.event
 async def on_ready():
     print(f"Bot is ready! Logged in as {bot.user}")
     await init_db()
+    await ensure_puuid_table()
+    await ensure_match_data_table()
+    
+    print("Pre-fetching PUUIDs...")
+    await prefetch_puuids()
+    
     check_streaks.start()
     check_strongest.start()
+
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} commands.")
     except Exception as e:
         print(f"Error syncing commands: {e}")
+
+# Add cleanup on shutdown
+@bot.event
+async def on_shutdown():
+    print("Bot is shutting down...")
+    await cleanup()  # Close the persistent session
+    await bot.close()
 
 bot.run(DISCORD_TOKEN)
