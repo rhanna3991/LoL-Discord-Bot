@@ -338,19 +338,25 @@ async def get_strongest_player(guild_id):
     strongest_player = None
     highest_rank = (0, 0, 0)
     
-    for summoner_name, region in players:
-        rank_data = await get_summoner_rank(region, summoner_name)
-        
-        if rank_data:
+    # Create tasks for all players
+    tasks = [
+        get_summoner_rank(region, summoner_name)
+        for summoner_name, region in players
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True) # Use return_exceptions to avoid crashing on a single failed API call
+
+    # Process results with corresponding player info
+    for (summoner_name, region), rank_data in zip(players, results):
+        if rank_data and not isinstance(rank_data, Exception):
             tier = rank_data["tier"]
             division = rank_data["rank"]
             lp = rank_data["lp"]
             
             if tier in ["MASTER", "GRANDMASTER", "CHALLENGER"]:
-                sort_key = (rank_order[tier], 0, lp)
+                sort_key = (rank_order.get(tier, 0), 0, lp)
             else:
                 division_value = {"I": 1, "II": 2, "III": 3, "IV": 4}.get(division, 4)
-                sort_key = (rank_order[tier], -division_value, lp)
+                sort_key = (rank_order.get(tier, 0), -division_value, lp)
             
             if sort_key > highest_rank:
                 highest_rank = sort_key
@@ -415,7 +421,7 @@ async def get_strongest_player(guild_id):
         strongest_player['is_new_strongest'] = is_new_strongest
         return strongest_player
 
-async def announce_strongest_player(channel, strongest_player):
+async def announce_strongest_player(target, strongest_player, is_interaction=False):
     """Helper function to announce the strongest player to a channel"""
     try:
         base_image = Image.open('TheStrongest.png')
@@ -453,10 +459,11 @@ async def announce_strongest_player(channel, strongest_player):
         
         file = discord.File(img_bytes, filename='TheStrongest.png')
         
+        tier_capitalized = strongest_player['tier'].capitalize()
         if strongest_player['tier'] in ["MASTER", "GRANDMASTER", "CHALLENGER"]:
-            rank_display = f"{strongest_player['tier']} - {strongest_player['lp']}LP"
+            rank_display = f"{tier_capitalized} - {strongest_player['lp']}LP"
         else:
-            rank_display = f"{strongest_player['tier']} {strongest_player['division']} - {strongest_player['lp']}LP"
+            rank_display = f"{tier_capitalized} {strongest_player['division']} - {strongest_player['lp']}LP"
         
         # Calculate duration in a natural format
         days = strongest_player['days_as_strongest']
@@ -469,9 +476,12 @@ async def announce_strongest_player(channel, strongest_player):
         else:
             duration = f"{days} {'DAY' if days == 1 else 'DAYS'}"
         
-        content = f"**🏆 THE STRONGEST HAS BEEN REIGNING FOR {duration} 🏆**\n{strongest_player['name']}     {rank_display}"
+        content = f"🏆  **{strongest_player['name']},** currently **{rank_display},** has been The Strongest for **{duration}**  🏆"
         
-        await channel.send(content=content, file=file)
+        if is_interaction:
+            await target.followup.send(content=content, file=file)
+        else:
+            await target.send(content=content, file=file)
         
     except Exception as e:
         print(f"Error posting strongest update: {e}")
@@ -518,7 +528,7 @@ async def strongest(interaction: discord.Interaction):
         await interaction.followup.send("No summoners are currently being tracked for this server.")
         return
 
-    await announce_strongest_player(interaction.channel, strongest_player)
+    await announce_strongest_player(interaction, strongest_player, is_interaction=True)
 
 @bot.tree.command(name="history", description="Show recent match history for a player.")
 async def history(interaction: discord.Interaction, riot_id: str, games: int = 10):
