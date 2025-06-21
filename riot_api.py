@@ -151,10 +151,6 @@ async def prefetch_puuids():
     
     if not riot_ids:
         return
-    
-    print(f"Pre-fetching PUUIDs for {len(riot_ids)} players...")
-    results = await batch_fetch_puuids(riot_ids)
-    print(f"Successfully cached {len(results)} PUUIDs")
 
 # Update get_puuid to use the batch system for single lookups
 async def get_puuid(riot_id):

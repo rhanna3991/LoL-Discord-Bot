@@ -794,14 +794,17 @@ async def check_streaks():
         players = await get_tracked_players(guild_id)
         for summoner_name, region in players:
             try:
-                matches = await get_match_history(region, summoner_name, 20)
-                if not matches or len(matches) < 5:
+                all_matches = await get_match_history(region, summoner_name, 20)
+                
+                # Filter out remakes (less than 4 minutes)
+                matches = [m for m in all_matches if m.get("gameDuration", 0) >= 240]
+
+                if not matches:
                     continue
                 
                 last_tilt_match_id, last_tilt_time, last_tilt_streak = await get_tiltcheck_cooldown(guild_id, summoner_name)
                 last_win_match_id, last_win_time, last_win_streak = await get_winstreak_cooldown(guild_id, summoner_name)
 
-                
                 if tilt_enabled and (not last_tilt_match_id or matches[0]["matchId"] != last_tilt_match_id):
                     streak = 0
                     for match in matches:
@@ -810,7 +813,8 @@ async def check_streaks():
                         else:
                             break
                     
-                    if streak >= 3 and streak > (last_tilt_streak or 0):
+                    # Send alert if streak is 3+ and we haven't already reported this exact streak
+                    if streak >= 3 and streak != last_tilt_streak:
                         channel = discord.utils.get(guild.text_channels, name="general") or guild.text_channels[0]
                         
                         if streak == 3:
@@ -824,7 +828,11 @@ async def check_streaks():
                         else:
                             message = f"💀 **{summoner_name}** is on a **{streak}-game losing streak**. Somebody call Riot!"
                         
-                        await channel.send(message)
+                        try:
+                            await channel.send(message)
+                        except Exception as e:
+                            print(f"Failed to send tilt alert: {e}")
+                        
                         await update_tiltcheck_cooldown(guild_id, summoner_name, matches[0]["matchId"], streak)
                 
                 if win_enabled and (not last_win_match_id or matches[0]["matchId"] != last_win_match_id):
@@ -835,7 +843,8 @@ async def check_streaks():
                         else:
                             break
                     
-                    if streak >= 3 and streak > (last_win_streak or 0):
+                    # Send alert if streak is 3+ and we haven't already reported this exact streak
+                    if streak >= 3 and streak != last_win_streak:
                         channel = discord.utils.get(guild.text_channels, name="general") or guild.text_channels[0]
                         
                         if streak == 3:
@@ -845,7 +854,11 @@ async def check_streaks():
                         else:
                             message = f"🔥 **{summoner_name}** is on a **{streak}-game winning streak**! Absolutely dominating!"
                         
-                        await channel.send(message)
+                        try:
+                            await channel.send(message)
+                        except Exception as e:
+                            print(f"Failed to send win alert: {e}")
+                        
                         await update_winstreak_cooldown(guild_id, summoner_name, matches[0]["matchId"], streak)
                 
                 await asyncio.sleep(1)
