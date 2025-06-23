@@ -7,7 +7,7 @@ from db import init_db, add_tracked_player, get_tracked_players, remove_tracked_
 from riot_api import (get_account_by_riot_id, get_summoner_rank, get_flex_rank, get_match_history, 
                      get_detailed_match_history, get_champion_mastery, get_specific_champion_mastery, 
                      get_last_played_games, get_role_summary, ensure_match_data_table, 
-                     ensure_puuid_table, cleanup, prefetch_puuids)
+                     ensure_puuid_table, cleanup, prefetch_puuids, clear_corrupted_puuid_cache, clear_expired_puuid_cache, clear_expired_match_data_cache, clear_corrupted_match_data_cache)
 import asyncio
 from datetime import datetime
 from discord.ui import View, Button
@@ -518,6 +518,22 @@ async def check_strongest():
 
         await announce_strongest_player(channel, strongest_player)
 
+@tasks.loop(hours=168)  # 7 days = 168 hours
+async def clean_puuid_cache():
+    """Clean PUUID cache every 7 days"""
+    print("Running scheduled PUUID cache cleanup...")
+    # Clear corrupted entries
+    corrupted_count = await clear_corrupted_puuid_cache()
+    # Clear expired entries
+    expired_count = await clear_expired_puuid_cache()
+    # Clear expired match data cache entries
+    await clear_expired_match_data_cache()
+    # Clear corrupted match data cache entries
+    corrupted_match_data = await clear_corrupted_match_data_cache()
+    if corrupted_match_data > 0:
+        print(f"Cleared {corrupted_match_data} corrupted match_data entries during scheduled cleanup")
+    print(f"Cache cleanup complete: {corrupted_count} corrupted, {expired_count} expired entries cleared")
+
 @bot.tree.command(name="strongest", description="Finds the strongest tracked player based on rank.")
 async def strongest(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -791,7 +807,7 @@ async def wincheck(interaction: discord.Interaction):
     status_msg = "enabled ✅" if enabled else "disabled ❌"
     await interaction.followup.send(f"Win streak alerts are now {status_msg}.")
 
-@tasks.loop(minutes=5)
+@tasks.loop(minutes=40)
 async def check_streaks():
     for guild in bot.guilds:
         guild_id = str(guild.id)
@@ -989,7 +1005,7 @@ async def setchannel(interaction: discord.Interaction):
     await interaction.followup.send(f"Notifications will now be sent to {interaction.channel.mention}")
 
 @bot.tree.command(name="firstblood", description="Show first blood statistics for a player.")
-async def firstblood(interaction: discord.Interaction, riot_id: str, games: int = 25):
+async def firstblood(interaction: discord.Interaction, riot_id: str, games: int = 20):
     await interaction.response.defer()
 
     if "#" not in riot_id:
@@ -1088,7 +1104,7 @@ async def firstblood(interaction: discord.Interaction, riot_id: str, games: int 
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="rolesummary", description="Show a player's role distribution.")
-async def rolesummary(interaction: discord.Interaction, riot_id: str, games: int = 50):
+async def rolesummary(interaction: discord.Interaction, riot_id: str, games: int = 20):
     await interaction.response.defer()
 
     if "#" not in riot_id:
@@ -1137,11 +1153,11 @@ async def rolesummary(interaction: discord.Interaction, riot_id: str, games: int
     await interaction.followup.send(embed=embed, file=file)
 
 @bot.tree.command(name="feederscore", description="Calculate a player's feeder score.")
-async def feederscore(interaction: discord.Interaction, riot_id: str, games: int = 25):
+async def feederscore(interaction: discord.Interaction, riot_id: str, games: int = 20):
     """Show the feeder score for a single player
     Usage: /feederscore [games] GameName#TAG
     Example: /feederscore 15 GameName#TAG
-    Default is 25 games"""
+    Default is 20 games"""
 
     await interaction.response.defer()
 
@@ -1595,13 +1611,22 @@ async def on_ready():
     await init_db()
     await ensure_puuid_table()
     await ensure_match_data_table()
-    
+    # Check for corrupted PUUID cache on startup
+    print("Checking for corrupted PUUID cache entries...")
+    corrupted_count = await clear_corrupted_puuid_cache()
+    if corrupted_count > 0:
+        print(f"Cleared {corrupted_count} corrupted PUUID entries on startup")
+    # Clear corrupted match data cache entries on startup
+    corrupted_match_data = await clear_corrupted_match_data_cache()
+    if corrupted_match_data > 0:
+        print(f"Cleared {corrupted_match_data} corrupted match_data entries on startup")
+    # Clear expired match data cache entries on startup
+    await clear_expired_match_data_cache()
     print("Pre-fetching PUUIDs...")
     await prefetch_puuids()
-    
     check_streaks.start()
     check_strongest.start()
-
+    clean_puuid_cache.start()
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} commands.")

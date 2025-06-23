@@ -19,6 +19,8 @@ puuid_cache = {}
 # TTL configurations
 MATCH_DATA_TTL = 32400  # 9 hours in seconds
 MATCH_HISTORY_TTL = 600  # 10 minutes in seconds
+PUUID_CACHE_TTL = 604800  # 7 days in seconds
+MATCH_DATA_CACHE_TTL = 15 * 24 * 60 * 60  # 2.5 weeks in seconds
 
 # Rate limiting and metrics
 rate_limit_lock = asyncio.Semaphore(20)  # allow 20 concurrent requests safely
@@ -54,6 +56,15 @@ async def fetch_json(url, headers):
             retry_after = int(response.headers.get('Retry-After', 10))
             await asyncio.sleep(retry_after)
             return await fetch_json(url, headers)
+        elif response.status == 400:
+            # Check for PUUID corruption error
+            try:
+                error_text = await response.text()
+                if "Exception decrypting" in error_text and "PUUID" in error_text:
+                    print(f"PUUID corruption detected: {error_text}")
+                    return None
+            except:
+                pass
         return await response.json() if response.status == 200 else None
 
 # Add shutdown handler to LeagueBot's on_ready
@@ -70,10 +81,57 @@ async def safe_request(session, url, headers, retries=3):
                     retry_after = int(response.headers.get("Retry-After", "1"))
                     print(f"Rate limit hit. Retrying in {retry_after} seconds...")
                     await asyncio.sleep(retry_after)
+                elif response.status == 400:
+                    # Check for PUUID corruption error
+                    try:
+                        error_text = await response.text()
+                        if "Exception decrypting" in error_text and "PUUID" in error_text:
+                            print(f"PUUID corruption detected: {error_text}")
+                            return None
+                    except:
+                        pass
                 else:
                     print(f"Error {response.status}: {await response.text()}")
                     return None
     return None
+
+def is_valid_puuid(puuid):
+    # Riot PUUIDs are long base64 strings, not UUIDs
+    return isinstance(puuid, str) and 30 <= len(puuid) <= 128
+
+async def clear_corrupted_puuid_cache():
+    """Clear corrupted PUUID cache entries"""
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        async with conn.execute("SELECT riot_id, puuid FROM puuid_cache") as cursor:
+            entries = await cursor.fetchall()
+        
+        corrupted_count = 0
+        for riot_id, puuid in entries:
+            if not is_valid_puuid(puuid):
+                await conn.execute("DELETE FROM puuid_cache WHERE riot_id = ?", (riot_id,))
+                corrupted_count += 1
+        
+        await conn.commit()
+        if corrupted_count > 0:
+            print(f"Cleared {corrupted_count} corrupted PUUID entries")
+        return corrupted_count
+
+async def clear_expired_puuid_cache():
+    """Clear expired PUUID cache entries (older than 7 days)"""
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        current_time = int(time.time())
+        cutoff_time = current_time - PUUID_CACHE_TTL
+        
+        async with conn.execute(
+            "DELETE FROM puuid_cache WHERE cached_at < ?",
+            (cutoff_time,)
+        ) as cursor:
+            deleted_count = cursor.rowcount
+        
+        await conn.commit()
+        if deleted_count > 0:
+            print(f"Cleared {deleted_count} expired PUUID entries")
+        return deleted_count
 
 async def ensure_puuid_table():
     async with aiosqlite.connect("riot_bot.db") as conn:
@@ -89,25 +147,57 @@ async def ensure_puuid_table():
 async def get_puuid_from_db(riot_id):
     async with aiosqlite.connect("riot_bot.db") as conn:
         async with conn.execute(
-            "SELECT puuid FROM puuid_cache WHERE riot_id = ?",
+            "SELECT puuid, cached_at FROM puuid_cache WHERE riot_id = ?",
             (riot_id.lower(),)
         ) as cursor:
             result = await cursor.fetchone()
-            return result[0] if result else None
+            if result:
+                puuid, cached_at = result
+                # Check if PUUID is valid and not expired
+                if is_valid_puuid(puuid) and (time.time() - cached_at) < PUUID_CACHE_TTL:
+                    return puuid
+                else:
+                    # Remove invalid or expired PUUID
+                    await conn.execute("DELETE FROM puuid_cache WHERE riot_id = ?", (riot_id.lower(),))
+                    await conn.commit()
+            return None
 
 async def save_puuid_to_db(riot_id, puuid):
+    # Only save valid PUUIDs
+    if not is_valid_puuid(puuid):
+        return False
+    
     async with aiosqlite.connect("riot_bot.db") as conn:
         await conn.execute(
             "INSERT OR REPLACE INTO puuid_cache (riot_id, puuid, cached_at) VALUES (?, ?, ?)",
             (riot_id.lower(), puuid, int(time.time()))
         )
         await conn.commit()
+        return True
+
+async def get_puuid(riot_id):
+    # Check memory cache first
+    if riot_id in puuid_cache:
+        cached_puuid = puuid_cache[riot_id]
+        if is_valid_puuid(cached_puuid):
+            return cached_puuid
+        else:
+            del puuid_cache[riot_id]
+    # Check database cache
+    db_puuid = await get_puuid_from_db(riot_id)
+    if db_puuid:
+        puuid_cache[riot_id] = db_puuid
+        return db_puuid
+    # Fetch single PUUID using batch system
+    results = await batch_fetch_puuids([riot_id])
+    puuid = results.get(riot_id)
+    if puuid:
+        puuid_cache[riot_id] = puuid
+    return puuid
 
 async def batch_fetch_puuids(riot_ids):
-    """Fetch multiple PUUIDs in batch, using cache where possible"""
     to_fetch = []
     results = {}
-    
     # Check cache first
     for riot_id in riot_ids:
         cached = await get_puuid_from_db(riot_id)
@@ -115,7 +205,6 @@ async def batch_fetch_puuids(riot_ids):
             results[riot_id] = cached
         else:
             to_fetch.append(riot_id)
-    
     # Fetch missing PUUIDs in chunks
     chunk_size = 10  # Adjust based on rate limits
     for i in range(0, len(to_fetch), chunk_size):
@@ -127,19 +216,15 @@ async def batch_fetch_puuids(riot_ids):
             game_name, tag_line = riot_id.split("#", 1)
             task = get_account_by_riot_id(game_name, tag_line)
             tasks.append(task)
-        
         chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
-        
         for riot_id, result in zip(chunk, chunk_results):
             if isinstance(result, Exception) or not result:
                 continue
             puuid = result.get("puuid")
-            if puuid:
+            if puuid and is_valid_puuid(puuid):
                 results[riot_id] = puuid
                 await save_puuid_to_db(riot_id, puuid)
-        
         await asyncio.sleep(1)  # Rate limit compliance
-    
     return results
 
 async def prefetch_puuids():
@@ -152,28 +237,18 @@ async def prefetch_puuids():
     if not riot_ids:
         return
 
-# Update get_puuid to use the batch system for single lookups
-async def get_puuid(riot_id):
-    # Check memory cache first
-    if riot_id in puuid_cache:
-        return puuid_cache[riot_id]
-    
-    # Check database cache
-    db_puuid = await get_puuid_from_db(riot_id)
-    if db_puuid:
-        puuid_cache[riot_id] = db_puuid
-        return db_puuid
-    
-    # Fetch single PUUID using batch system
-    results = await batch_fetch_puuids([riot_id])
-    return results.get(riot_id)
-
 async def get_account_by_riot_id(game_name, tag_line):
     headers = {"X-Riot-Token": RIOT_API_KEY}
     url = f"https://americas.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
-    return await fetch_json(url, headers)
+    result = await fetch_json(url, headers)
+    return result
 
 async def get_summoner_by_puuid(region, puuid):
+    # Validate PUUID before making API call
+    if not is_valid_puuid(puuid):
+        print(f"Invalid PUUID provided to get_summoner_by_puuid: {puuid}")
+        return None
+    
     async with aiohttp.ClientSession() as session:
         url = f"https://{region}.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/{puuid}"
         headers = {"X-Riot-Token": RIOT_API_KEY}
@@ -263,24 +338,15 @@ async def get_match_timeline(session, match_id):
     return await fetch_json(url, headers)
 
 async def get_summoner_rank(region, riot_id):
-    """Get summoner rank using Riot ID format (GameName#TAG)"""
     puuid = await get_puuid(riot_id)
     if not puuid:
         return None
     async with aiohttp.ClientSession() as session:
-        # Get summoner data using PUUID
-        summoner_data = await get_summoner_by_puuid(region, puuid)
-        if not summoner_data:
-            print(f"Could not find summoner data for {riot_id}")
-            return None
-        summoner_id = summoner_data["id"]
-        # Get rank data
-        rank_url = f"https://{region}.api.riotgames.com/lol/league/v4/entries/by-summoner/{summoner_id}"
+        rank_url = f"https://{region}.api.riotgames.com/lol/league/v4/entries/by-puuid/{puuid}"
         headers = {"X-Riot-Token": RIOT_API_KEY}
         ranks = await fetch_json(rank_url, headers)
         if not ranks:
             return None
-        # Look for Solo/Duo queue rank
         for queue in ranks:
             if queue["queueType"] == "RANKED_SOLO_5x5":
                 return {
@@ -291,24 +357,15 @@ async def get_summoner_rank(region, riot_id):
     return None
 
 async def get_flex_rank(region, riot_id):
-    """Get summoner's Flex queue rank using Riot ID format (GameName#TAG)"""
     puuid = await get_puuid(riot_id)
     if not puuid:
         return None
     async with aiohttp.ClientSession() as session:
-        # Get summoner data using PUUID
-        summoner_data = await get_summoner_by_puuid(region, puuid)
-        if not summoner_data:
-            print(f"Could not find summoner data for {riot_id}")
-            return None
-        summoner_id = summoner_data["id"]
-        # Get rank data
-        rank_url = f"https://{region}.api.riotgames.com/lol/league/v4/entries/by-summoner/{summoner_id}"
+        rank_url = f"https://{region}.api.riotgames.com/lol/league/v4/entries/by-puuid/{puuid}"
         headers = {"X-Riot-Token": RIOT_API_KEY}
         ranks = await fetch_json(rank_url, headers)
         if not ranks:
             return None
-        # Look for Flex queue rank
         for queue in ranks:
             if queue["queueType"] == "RANKED_FLEX_SR":
                 return {
@@ -781,5 +838,34 @@ guild_throttler = GuildThrottler()
 async def check_streaks_for_guild(guild_id, players):
     """Check streaks for a single guild with throttling"""
     await guild_throttler.wait_for_guild(guild_id, len(players))
-    # ... rest of the streak checking logic ...
+
+async def clear_expired_match_data_cache():
+    """Clear expired match data cache entries (older than 2.5 weeks)"""
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        cutoff_time = int(time.time()) - MATCH_DATA_CACHE_TTL
+        await conn.execute(
+            "DELETE FROM match_data WHERE cached_at < ?",
+            (cutoff_time,)
+        )
+        await conn.commit()
+
+async def clear_corrupted_match_data_cache():
+    """Remove match_data entries where the data column is not valid JSON or missing required fields."""
+    async with aiosqlite.connect("riot_bot.db") as conn:
+        async with conn.execute("SELECT match_id, data FROM match_data") as cursor:
+            rows = await cursor.fetchall()
+        corrupted = 0
+        for match_id, data in rows:
+            try:
+                parsed = json.loads(data)
+                # Optionally, check for required keys
+                if not isinstance(parsed, dict) or "info" not in parsed or "metadata" not in parsed:
+                    raise ValueError("Missing required keys")
+            except Exception:
+                await conn.execute("DELETE FROM match_data WHERE match_id = ?", (match_id,))
+                corrupted += 1
+        await conn.commit()
+    if corrupted > 0:
+        print(f"Cleared {corrupted} corrupted match_data entries")
+    return corrupted
 
