@@ -178,7 +178,7 @@ async def help(interaction: discord.Interaction):
     embed.add_field(
         name="📊 Performance & Analysis",
         value=(
-            "`/stats` — Show a player'sfull performance breakdown\n"
+            "`/stats` — Show a player's full performance breakdown\n"
             "`/history` — Show a player's match history\n"
             "`/feederscore` — Calculate feeder score\n"
             "`/rolesummary` — View a player's role distribution\n"
@@ -246,7 +246,7 @@ async def add(interaction: discord.Interaction, riot_id: str):
 
 @bot.tree.command(name="remove", description="Remove a player from the tracking list.")
 async def remove(interaction: discord.Interaction, riot_id: str):
-    await interaction.response.defer(ephemeral=True) # Defer ephemerally
+    await interaction.response.defer()
 
     if not riot_id:
         await interaction.followup.send("You need to provide a summoner name to remove.")
@@ -578,29 +578,28 @@ async def strongest(interaction: discord.Interaction):
 
 @bot.tree.command(name="history", description="Show recent match history for a player.")
 async def history(interaction: discord.Interaction, riot_id: str, games: int = 10):
-    await interaction.response.defer()
-
+    
     if '#' not in riot_id:
-        await interaction.followup.send("Please use format: GameName#TAG")
+        await interaction.response.send_message("Please use format: GameName#TAG", ephemeral=True)
         return
 
     if games < 1:
-        await interaction.followup.send("Please request at least 1 game.")
+        await interaction.response.send_message("Please request at least 1 game.", ephemeral=True)
         return
     if games > 20:
-        await interaction.followup.send("Maximum of 20 games can be shown at once.")
+        await interaction.response.send_message("For future reference, a maxiumum of only 20 games can be displayed.", ephemeral=True)
         games = 20
 
     game_name, tag_line = riot_id.split("#", 1)
     cleaned_riot_id = f"{game_name.strip()}#{tag_line.strip()}"
 
-    await interaction.followup.send(f"Fetching last {games} games for {cleaned_riot_id}...")
-
     matches = await get_match_history(DEFAULT_REGION, cleaned_riot_id, games)
 
     if not matches:
-        await interaction.followup.send("No match history found or rate limit reached.")
+        await interaction.response.send_message("No match history found or rate limit reached.", ephemeral=True)
         return
+    
+    await interaction.response.defer(thinking=True)
 
     embed = discord.Embed(
         title=f"Latest {len(matches)} Games for {cleaned_riot_id}",
@@ -620,17 +619,19 @@ async def history(interaction: discord.Interaction, riot_id: str, games: int = 1
         safe_tag_line = urllib.parse.quote(tag_line.strip().replace(" ", "-"))
         deeplol_link = f"https://www.deeplol.gg/summoner/na/{safe_game_name}-{safe_tag_line}/matches/{match['matchId']}"
 
+        champion_emoji = get_champion_emoji(match['champion'])
+
         value = (
-            f"**{result_emoji} Ranked Solo/Duo**\n"
-            f"Champion: {match['champion']}\n"
-            f"KDA: {kda} ({kda_ratio:.2f})\n"
-            f"Duration: {duration}\n"
-            f"Time: {match_time}\n"
-            f"[View Match Link]({deeplol_link})"
+            f"**Game {i}**\u2002•\u2002{result_emoji}\u2002•\u2002Ranked Solo/Duo\n"
+            f"{champion_emoji}\u2002-\u2002{match['champion']}\n"
+            f"**KDA**: {kda} ({kda_ratio:.2f} KDA)\n"
+            f"**Duration**: {duration}\n"
+            f"**Date**: {match_time}\n"
+            f"[View Match Link]({deeplol_link})\n"
         )
 
         embed.add_field(
-            name=f"Game {i}",
+            name="\u200b",
             value=value,
             inline=False
         )
@@ -653,25 +654,18 @@ async def history(interaction: discord.Interaction, riot_id: str, games: int = 1
 
 @bot.tree.command(name="stats", description="Show detailed statistics for a player over a number of games.")
 async def stats(interaction: discord.Interaction, riot_id: str, games: int = 20):
-    """Show detailed statistics for a player over X games
-    Usage: /stats [games] SummonerName#TAG
-    Example: /stats 50 SummonerName#TAG
-    Default is 20 games, maximum is 100"""
-    
-    await interaction.response.defer()
-
     if games < 1:
-        await interaction.followup.send("Please request at least 1 game.")
+        await interaction.response.send_message("Please request at least 1 game.", ephemeral=True)
         return
     if games > 100:
-        await interaction.followup.send("Maximum of 100 games for stats calculation. Using 100 games.")
+        await interaction.response.send_message("Maximum of 100 games for stats calculation. Using 100 games.", ephemeral=True)
         games = 100
 
     if "#" not in riot_id:
-        await interaction.followup.send("Please use format: GameName#TAG")
+        await interaction.response.send_message("Please use format: GameName#TAG", ephemeral=True)
         return
 
-    await interaction.followup.send(f"Calculating stats for {riot_id} over last {games} ranked games... This may take a moment.")
+    await interaction.response.defer()
     
     matches = await get_detailed_match_history(DEFAULT_REGION, riot_id, games)
     
@@ -719,37 +713,46 @@ async def stats(interaction: discord.Interaction, riot_id: str, games: int = 20)
     )
     
     embed.add_field(
-        name="Overall Performance",
-        value=f"**Winrate:** {wins}W-{losses}L ({winrate:.1f}%)\n"
-              f"**Average KDA:** {average_kda:.2f} ({total_kills}/{total_deaths}/{total_assists})\n"
-              f"**CS/min:** {cs_per_min:.1f}",
+        name="📊 **Overall Performance**",
+        value=f"Winrate: {wins}W–{losses}L (**{winrate:.1f}%**)\n"
+              f"Average KDA: **{average_kda:.2f}** ({total_kills}/{total_deaths}/{total_assists})\n"
+              f"CS/min: **{cs_per_min:.1f}**",
         inline=False
     )
+    
+    embed.add_field(name="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", value="", inline=False)
     
     if sorted_champions:
         champ_text = ""
         for champ, stats in sorted_champions:
             champ_wr = (stats['wins'] / stats['games']) * 100
             champ_kda = (stats['kills'] + stats['assists']) / max(1, stats['deaths'])
-            champ_text += f"**{champ}** - {stats['games']} games ({champ_wr:.0f}% WR, {champ_kda:.2f} KDA)\n"
+            champion_emoji = get_champion_emoji(champ)
+            champ_text += (
+                f"{champion_emoji}**{champ}** — {stats['games']} games (**{champ_wr:.0f}% WR**, {champ_kda:.2f} KDA)\n"
+                if champion_emoji else
+                f"**{champ}** — {stats['games']} games (**{champ_wr:.0f}% WR**, {champ_kda:.2f} KDA)\n"
+            )
         
         embed.add_field(
-            name="Most Played Champions",
+            name="**Most Played Champions**",
             value=champ_text.strip(),
             inline=False
         )
+        
+        embed.add_field(name="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", value="", inline=False)
     
     embed.add_field(
-        name="Team Contribution",
-        value=f"**Kill Participation:** {avg_kill_participation:.1f}%\n"
-              f"**Damage Share:** {avg_damage_share:.1f}%\n"
-              f"**Gold Share:** {avg_gold_share:.1f}%\n"
-              f"**Avg Vision Score:** {avg_vision_score:.1f}",
+        name="🤝 **Team Contribution**",
+        value=f"Kill Participation: **{avg_kill_participation:.1f}%**\n"
+              f"Damage Share: **{avg_damage_share:.1f}%**\n"
+              f"Gold Share: **{avg_gold_share:.1f}%**\n"
+              f"Vision Score: **{avg_vision_score:.1f}**",
         inline=False
     )
     
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    embed.set_footer(text=f"Stats calculated from last {total_games} ranked games • {timestamp}")
+    embed.set_footer(text=f"Stats from last {total_games} ranked games • {timestamp}")
     
     await interaction.followup.send(embed=embed)
 
@@ -769,13 +772,11 @@ async def champion_name_autocomplete(
 @bot.tree.command(name="mastery", description="Show champion mastery for a player.")
 @app_commands.autocomplete(champion_name=champion_name_autocomplete)
 async def mastery(interaction: discord.Interaction, riot_id: str, champion_name: str = None):
-    await interaction.response.defer()
-
     if "#" not in riot_id:
-        await interaction.followup.send("Please use format: GameName#TAG")
+        await interaction.response.send_message("Please use format: GameName#TAG", ephemeral=True)
         return
     
-    await interaction.followup.send(f"Fetching mastery data for {riot_id}...")
+    await interaction.response.defer()
     
     if champion_name:
         mastery = await get_specific_champion_mastery(DEFAULT_REGION, riot_id, champion_name)
@@ -806,14 +807,14 @@ async def mastery(interaction: discord.Interaction, riot_id: str, champion_name:
         
         await interaction.followup.send(embed=embed)
     else:
-        masteries = await get_champion_mastery(DEFAULT_REGION, riot_id, 12)
+        masteries = await get_champion_mastery(DEFAULT_REGION, riot_id, 15)
         
         if not masteries:
             await interaction.followup.send("Rate limit reached. Please try again in 2 minutes.")
             return
         
         embed = discord.Embed(
-            title=f"Top 12 Champion Masteries for {riot_id}",
+            title=f"Top 15 Champion Masteries for {riot_id}",
             color=discord.Color(0x00FFFF)
         )
         
@@ -942,13 +943,11 @@ async def check_streaks():
 
 @bot.tree.command(name="lastplayed", description="Show last played games for different modes.")
 async def lastplayed(interaction: discord.Interaction, riot_id: str):
-    await interaction.response.defer()
-
     if "#" not in riot_id:
-        await interaction.followup.send("Please use format: SummonerName#TAG")
+        await interaction.response.send_message("Please use format: SummonerName#TAG", ephemeral=True)
         return
     
-    await interaction.followup.send(f"Fetching last played games for {riot_id}...")
+    await interaction.response.defer()
     
     last_games = await get_last_played_games(DEFAULT_REGION, riot_id)
     if not last_games:
@@ -1018,11 +1017,11 @@ async def lastplayed(interaction: discord.Interaction, riot_id: str):
 
 @bot.tree.command(name="rank", description="Show a player's current rank.")
 async def rank(interaction: discord.Interaction, riot_id: str):
-    await interaction.response.defer()
-
     if "#" not in riot_id:
-        await interaction.followup.send("Please use format: GameName#TAG")
+        await interaction.response.send_message("Please use format: GameName#TAG", ephemeral=True)
         return
+    
+    await interaction.response.defer()
     
     rank_data = await get_summoner_rank(DEFAULT_REGION, riot_id)
     
@@ -1051,13 +1050,11 @@ async def setchannel(interaction: discord.Interaction):
 
 @bot.tree.command(name="firstblood", description="Show first blood statistics for a player.")
 async def firstblood(interaction: discord.Interaction, riot_id: str, games: int = 20):
-    await interaction.response.defer()
-
     if "#" not in riot_id:
-        await interaction.followup.send("Please use format: GameName#TAG")
+        await interaction.response.send_message("Please use format: GameName#TAG", ephemeral=True)
         return
 
-    await interaction.followup.send(f"Calculating first blood stats for {riot_id} over last {games} games...")
+    await interaction.response.defer()
 
     tag_line_index = riot_id.rfind('#')
     game_name = riot_id[:tag_line_index].strip()
@@ -1150,13 +1147,11 @@ async def firstblood(interaction: discord.Interaction, riot_id: str, games: int 
 
 @bot.tree.command(name="rolesummary", description="Show a player's role distribution.")
 async def rolesummary(interaction: discord.Interaction, riot_id: str, games: int = 20):
-    await interaction.response.defer()
-
     if "#" not in riot_id:
-        await interaction.followup.send("Please use format: GameName#TAG")
+        await interaction.response.send_message("Please use format: GameName#TAG", ephemeral=True)
         return
     
-    await interaction.followup.send(f"Analyzing role distribution for {riot_id}...")
+    await interaction.response.defer()
     
     role_data = await get_role_summary(DEFAULT_REGION, riot_id, games)
     if not role_data:
@@ -1199,23 +1194,16 @@ async def rolesummary(interaction: discord.Interaction, riot_id: str, games: int
 
 @bot.tree.command(name="feederscore", description="Calculate a player's feeder score.")
 async def feederscore(interaction: discord.Interaction, riot_id: str, games: int = 20):
-    """Show the feeder score for a single player
-    Usage: /feederscore [games] GameName#TAG
-    Example: /feederscore 15 GameName#TAG
-    Default is 20 games"""
+    if "#" not in riot_id:
+        await interaction.response.send_message("Please use format: GameName#TAG", ephemeral=True)
+        return
 
     await interaction.response.defer()
-
-    if "#" not in riot_id:
-        await interaction.followup.send("Please use format: GameName#TAG")
-        return
 
     tag_line_index = riot_id.rfind('#')
     game_name = riot_id[:tag_line_index].strip()
     tag_line = riot_id[tag_line_index + 1:].strip()
     cleaned_riot_id = f"{game_name}#{tag_line}"
-
-    await interaction.followup.send(f"Calculating feeder score for {cleaned_riot_id} over last {games} games... This may take a moment.")
 
     def calculate_feeder_score(stats, game_number):
         deaths       = stats["deaths"]
@@ -1443,11 +1431,11 @@ async def feederscore(interaction: discord.Interaction, riot_id: str, games: int
 
 @bot.tree.command(name="link", description="Link a Discord account to a Riot ID for duo notifications.")
 async def link(interaction: discord.Interaction, riot_id: str, discord_user: discord.Member = None):
-    await interaction.response.defer(ephemeral=True)
-
     if "#" not in riot_id:
-        await interaction.followup.send("Invalid Riot ID. Use the format SummonerName#TAG")
+        await interaction.response.send_message("Invalid Riot ID. Use the format SummonerName#TAG", ephemeral=True)
         return
+
+    await interaction.response.defer()
 
     # If no discord_user specified, use the command caller
     target_user = discord_user or interaction.user
@@ -1468,7 +1456,7 @@ async def link(interaction: discord.Interaction, riot_id: str, discord_user: dis
         await link_discord_riot(str(interaction.guild.id), str(target_user.id), riot_id)
         
         if target_user.id == interaction.user.id:
-            await interaction.followup.send(f"Successfully linked your Discord account to **{riot_id}**!")
+            await interaction.followup.send(f"Successfully linked the Discord account to **{riot_id}**!")
         else:
             await interaction.followup.send(f"Successfully linked {target_user.mention}'s Discord account to **{riot_id}**!")
     except ValueError as e:
@@ -1478,7 +1466,7 @@ async def link(interaction: discord.Interaction, riot_id: str, discord_user: dis
 
 @bot.tree.command(name="unlink", description="Unlink a Discord account from its Riot ID.")
 async def unlink(interaction: discord.Interaction, discord_user: discord.Member = None):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
 
     # If no discord_user specified, use the command caller
     target_user = discord_user or interaction.user
@@ -1494,7 +1482,7 @@ async def unlink(interaction: discord.Interaction, discord_user: discord.Member 
         await unlink_discord_riot(str(interaction.guild.id), str(target_user.id))
         
         if target_user.id == interaction.user.id:
-            await interaction.followup.send(f"Successfully unlinked your Discord account from **{riot_id}**!")
+            await interaction.followup.send(f"Successfully unlinked the Discord account from **{riot_id}**!")
         else:
             await interaction.followup.send(f"Successfully unlinked {target_user.mention}'s Discord account from **{riot_id}**!")
     except Exception as e:
@@ -1507,13 +1495,13 @@ async def unlink(interaction: discord.Interaction, discord_user: discord.Member 
     app_commands.Choice(name="Unranked", value="unranked")
 ])
 async def lfg(interaction: discord.Interaction, queue_type: app_commands.Choice[str]):
-    await interaction.response.defer()
-
     # Get the caller's Riot ID from the mapping
     caller_riot_id = await get_riot_id_for_discord(str(interaction.guild.id), str(interaction.user.id))
     if not caller_riot_id:
-        await interaction.followup.send("You need to link your Discord account to a Riot ID first. Use `/link` to set this up.", ephemeral=True)
+        await interaction.response.send_message("You need to link your Discord account to a Riot ID first. Use `/link` to set this up.", ephemeral=True)
         return
+
+    await interaction.response.defer()
 
     # Get all other mapped users from the leaderboard
     mapped_users = await get_all_mapped_players(str(interaction.guild.id))
@@ -1599,7 +1587,7 @@ async def lfg(interaction: discord.Interaction, queue_type: app_commands.Choice[
             eligible_users.append((discord_id, riot_id))
 
     if not eligible_users:
-        await interaction.followup.send("Sorry! You're either too garbage or godlike to duo with someone in this server.", ephemeral=True)
+        await interaction.followup.send("Sorry! You're either too garbage or godlike to duo with someone in this server.")
         return
 
     # Create the notification message
@@ -1629,7 +1617,7 @@ async def lfg(interaction: discord.Interaction, queue_type: app_commands.Choice[
     app_commands.Choice(name="No", value="N")
 ])
 async def clear(interaction: discord.Interaction, confirm: app_commands.Choice[str]):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     
     if confirm.value == "N":
         await interaction.followup.send("Leaderboard clear cancelled.")
