@@ -7,7 +7,7 @@ from db import init_db, add_tracked_player, get_tracked_players, remove_tracked_
 from riot_api import (get_account_by_riot_id, get_summoner_rank, get_flex_rank, get_match_history, 
                      get_detailed_match_history, get_champion_mastery, get_specific_champion_mastery, 
                      get_last_played_games, get_role_summary, ensure_match_data_table, 
-                     ensure_puuid_table, cleanup, prefetch_puuids, clear_corrupted_puuid_cache, clear_expired_puuid_cache, clear_expired_match_data_cache, clear_corrupted_match_data_cache)
+                     ensure_puuid_table, cleanup, prefetch_puuids, clear_corrupted_puuid_cache, clear_expired_puuid_cache, clear_expired_match_data_cache, clear_corrupted_match_data_cache, get_champion_data)
 import asyncio
 from datetime import datetime
 from discord.ui import View, Button
@@ -30,6 +30,36 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 
 DEFAULT_REGION = "na1"
+
+SPECIAL_EMOJI_NAMES = {
+    "Kha'Zix": "Khazix",
+    "Dr. Mundo": "DrMundo",
+    "LeBlanc": "Leblanc",
+    "Rek'Sai": "Reksai",
+    "Kai'Sa": "Kaisa",
+    "Cho'Gath": "Chogath",
+    "Vel'Koz": "Velkoz",
+    "Nunu & Willump": "Nunu",
+    "Bel'Veth": "Belveth",
+    "K'Sante": "KSante",
+}
+
+def get_champion_emoji(champion_name):
+    """Get the champion emoji from bot's app emojis"""
+    if not hasattr(bot, 'app_emojis'):
+        return ""
+    # Use special mapping if needed
+    lookup_name = SPECIAL_EMOJI_NAMES.get(champion_name, champion_name)
+    # Try the mapped name and a version with spaces/apostrophes removed
+    candidates = [
+        lookup_name,
+        lookup_name.replace(" ", "").replace("'", "")
+    ]
+    for name in candidates:
+        if name in bot.app_emojis:
+            emoji_id = bot.app_emojis[name]
+            return f"<:{name}:{emoji_id}>"
+    return ""
 
 async def create_hastebin(content):
     """Create a paste using a Hastebin-compatible mirror that allows anonymous posting."""
@@ -723,7 +753,21 @@ async def stats(interaction: discord.Interaction, riot_id: str, games: int = 20)
     
     await interaction.followup.send(embed=embed)
 
+async def champion_name_autocomplete(
+    interaction: discord.Interaction,
+    current: str
+):
+    # Get all champion names (cache this if possible)
+    id_to_name, _ = await get_champion_data()
+    all_names = sorted(id_to_name.values())
+    # Filter by what the user has typed so far
+    return [
+        app_commands.Choice(name=champ, value=champ)
+        for champ in all_names if current.lower() in champ.lower()
+    ][:25]  # Discord only allows up to 25 choices
+
 @bot.tree.command(name="mastery", description="Show champion mastery for a player.")
+@app_commands.autocomplete(champion_name=champion_name_autocomplete)
 async def mastery(interaction: discord.Interaction, riot_id: str, champion_name: str = None):
     await interaction.response.defer()
 
@@ -746,12 +790,16 @@ async def mastery(interaction: discord.Interaction, riot_id: str, champion_name:
         )
         
         points = f"{mastery['championPoints']:,}"
+        champion_emoji = get_champion_emoji(mastery['championName'])
         
-        embed.add_field(
-            name=f"**{mastery['championName']}**",
-            value=f"Mastery {mastery['championLevel']}\n{points} points",
-            inline=False
+        formatted_line = (
+            f"{champion_emoji} **{mastery['championName']}**: "
+            f"Mastery {mastery['championLevel']} – {points} points"
+            if champion_emoji else
+            f"**{mastery['championName']}**: Mastery {mastery['championLevel']} – {points} points"
         )
+
+        embed.description = formatted_line
         
         timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
         embed.set_footer(text=f"Last updated: {timestamp}")
@@ -774,19 +822,16 @@ async def mastery(interaction: discord.Interaction, riot_id: str, champion_name:
         
         total_mastery = sum(champ["championPoints"] for champ in masteries)
         
+        description_lines = []
         for i, champ in enumerate(masteries, 1):
-            value = f"Mastery {champ['championLevel']}\n{format_points(champ['championPoints'])} points"
-            
-            embed.add_field(
-                name=f"{i}. **{champ['championName']}**",
-                value=value,
-                inline=True
+            champion_emoji = get_champion_emoji(champ['championName'])
+            line = (
+                f"{i}. {champion_emoji} **{champ['championName']}**: Mastery {champ['championLevel']} – {format_points(champ['championPoints'])} points"
+                if champion_emoji else
+                f"{i}. **{champ['championName']}**: Mastery {champ['championLevel']} – {format_points(champ['championPoints'])} points"
             )
-        
-        remaining_slots = len(masteries) % 3
-        if remaining_slots != 0:
-            for _ in range(3 - remaining_slots):
-                embed.add_field(name="\u200b", value="\u200b", inline=True)
+            description_lines.append(line)
+        embed.description = "\n".join(description_lines)
         
         timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
         embed.set_footer(text=f"Last updated: {timestamp}")
@@ -1605,9 +1650,23 @@ async def clear(interaction: discord.Interaction, confirm: app_commands.Choice[s
     except Exception as e:
         await interaction.followup.send(f"Failed to clear leaderboard: {e}")
 
+async def fetch_app_emojis(bot):
+    app_id = bot.user.id
+    token = os.getenv("DISCORD_TOKEN")
+    url = f"https://discord.com/api/v10/applications/{app_id}/emojis"
+    headers = {"Authorization": f"Bot {token}"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            data = await resp.json()
+            bot.app_emojis = {e['name']: e['id'] for e in data.get('items', [])}
+
 @bot.event
 async def on_ready():
     print(f"Bot is ready! Logged in as {bot.user}")
+    
+    await fetch_app_emojis(bot)
+    print(f"Fetched {len(getattr(bot, 'app_emojis', {}))} app emojis: {list(getattr(bot, 'app_emojis', {}).keys())[:20]}")
+
     await init_db()
     await ensure_puuid_table()
     await ensure_match_data_table()
