@@ -578,28 +578,27 @@ async def strongest(interaction: discord.Interaction):
 
 @bot.tree.command(name="history", description="Show recent match history for a player.")
 async def history(interaction: discord.Interaction, riot_id: str, games: int = 10):
+    await interaction.response.defer(thinking=True)
     
     if '#' not in riot_id:
-        await interaction.response.send_message("Please use format: GameName#TAG", ephemeral=True)
+        await interaction.followup.send("Please use format: GameName#TAG", ephemeral=True)
         return
 
     if games < 1:
-        await interaction.response.send_message("Please request at least 1 game.", ephemeral=True)
+        await interaction.followup.send("Please request at least 1 game.", ephemeral=True)
         return
     if games > 20:
-        await interaction.response.send_message("For future reference, a maxiumum of only 20 games can be displayed.", ephemeral=True)
+        await interaction.followup.send("For future reference, a maxiumum of only 20 games can be displayed.", ephemeral=True)
         games = 20
 
     game_name, tag_line = riot_id.split("#", 1)
     cleaned_riot_id = f"{game_name.strip()}#{tag_line.strip()}"
-
+    
     matches = await get_match_history(DEFAULT_REGION, cleaned_riot_id, games)
 
     if not matches:
-        await interaction.response.send_message("No match history found or rate limit reached.", ephemeral=True)
+        await interaction.followup.send("No match history found or rate limit reached.", ephemeral=True)
         return
-    
-    await interaction.response.defer(thinking=True)
 
     embed = discord.Embed(
         title=f"Latest {len(matches)} Games for {cleaned_riot_id}",
@@ -654,18 +653,18 @@ async def history(interaction: discord.Interaction, riot_id: str, games: int = 1
 
 @bot.tree.command(name="stats", description="Show detailed statistics for a player over a number of games.")
 async def stats(interaction: discord.Interaction, riot_id: str, games: int = 20):
+    await interaction.response.defer()
+    
     if games < 1:
-        await interaction.response.send_message("Please request at least 1 game.", ephemeral=True)
+        await interaction.followup.send("Please request at least 1 game.", ephemeral=True)
         return
     if games > 100:
-        await interaction.response.send_message("Maximum of 100 games for stats calculation. Using 100 games.", ephemeral=True)
+        await interaction.followup.send("Maximum of 100 games for stats calculation. Using 100 games.", ephemeral=True)
         games = 100
 
     if "#" not in riot_id:
-        await interaction.response.send_message("Please use format: GameName#TAG", ephemeral=True)
+        await interaction.followup.send("Please use format: GameName#TAG", ephemeral=True)
         return
-
-    await interaction.response.defer()
     
     matches = await get_detailed_match_history(DEFAULT_REGION, riot_id, games)
     
@@ -772,11 +771,11 @@ async def champion_name_autocomplete(
 @bot.tree.command(name="mastery", description="Show champion mastery for a player.")
 @app_commands.autocomplete(champion_name=champion_name_autocomplete)
 async def mastery(interaction: discord.Interaction, riot_id: str, champion_name: str = None):
-    if "#" not in riot_id:
-        await interaction.response.send_message("Please use format: GameName#TAG", ephemeral=True)
-        return
-    
     await interaction.response.defer()
+    
+    if "#" not in riot_id:
+        await interaction.followup.send("Please use format: GameName#TAG", ephemeral=True)
+        return
     
     if champion_name:
         mastery = await get_specific_champion_mastery(DEFAULT_REGION, riot_id, champion_name)
@@ -943,11 +942,11 @@ async def check_streaks():
 
 @bot.tree.command(name="lastplayed", description="Show last played games for different modes.")
 async def lastplayed(interaction: discord.Interaction, riot_id: str):
-    if "#" not in riot_id:
-        await interaction.response.send_message("Please use format: SummonerName#TAG", ephemeral=True)
-        return
-    
     await interaction.response.defer()
+    
+    if "#" not in riot_id:
+        await interaction.followup.send("Please use format: SummonerName#TAG", ephemeral=True)
+        return
     
     last_games = await get_last_played_games(DEFAULT_REGION, riot_id)
     if not last_games:
@@ -1017,11 +1016,11 @@ async def lastplayed(interaction: discord.Interaction, riot_id: str):
 
 @bot.tree.command(name="rank", description="Show a player's current rank.")
 async def rank(interaction: discord.Interaction, riot_id: str):
-    if "#" not in riot_id:
-        await interaction.response.send_message("Please use format: GameName#TAG", ephemeral=True)
-        return
-    
     await interaction.response.defer()
+    
+    if "#" not in riot_id:
+        await interaction.followup.send("Please use format: GameName#TAG", ephemeral=True)
+        return
     
     rank_data = await get_summoner_rank(DEFAULT_REGION, riot_id)
     
@@ -1050,11 +1049,11 @@ async def setchannel(interaction: discord.Interaction):
 
 @bot.tree.command(name="firstblood", description="Show first blood statistics for a player.")
 async def firstblood(interaction: discord.Interaction, riot_id: str, games: int = 20):
-    if "#" not in riot_id:
-        await interaction.response.send_message("Please use format: GameName#TAG", ephemeral=True)
-        return
-
     await interaction.response.defer()
+    
+    if "#" not in riot_id:
+        await interaction.followup.send("Please use format: GameName#TAG", ephemeral=True)
+        return
 
     tag_line_index = riot_id.rfind('#')
     game_name = riot_id[:tag_line_index].strip()
@@ -1147,11 +1146,11 @@ async def firstblood(interaction: discord.Interaction, riot_id: str, games: int 
 
 @bot.tree.command(name="rolesummary", description="Show a player's role distribution.")
 async def rolesummary(interaction: discord.Interaction, riot_id: str, games: int = 20):
-    if "#" not in riot_id:
-        await interaction.response.send_message("Please use format: GameName#TAG", ephemeral=True)
-        return
-    
     await interaction.response.defer()
+    
+    if "#" not in riot_id:
+        await interaction.followup.send("Please use format: GameName#TAG", ephemeral=True)
+        return
     
     role_data = await get_role_summary(DEFAULT_REGION, riot_id, games)
     if not role_data:
@@ -1194,11 +1193,11 @@ async def rolesummary(interaction: discord.Interaction, riot_id: str, games: int
 
 @bot.tree.command(name="feederscore", description="Calculate a player's feeder score.")
 async def feederscore(interaction: discord.Interaction, riot_id: str, games: int = 20):
-    if "#" not in riot_id:
-        await interaction.response.send_message("Please use format: GameName#TAG", ephemeral=True)
-        return
-
     await interaction.response.defer()
+    
+    if "#" not in riot_id:
+        await interaction.followup.send("Please use format: GameName#TAG", ephemeral=True)
+        return
 
     tag_line_index = riot_id.rfind('#')
     game_name = riot_id[:tag_line_index].strip()
@@ -1431,11 +1430,11 @@ async def feederscore(interaction: discord.Interaction, riot_id: str, games: int
 
 @bot.tree.command(name="link", description="Link a Discord account to a Riot ID for duo notifications.")
 async def link(interaction: discord.Interaction, riot_id: str, discord_user: discord.Member = None):
-    if "#" not in riot_id:
-        await interaction.response.send_message("Invalid Riot ID. Use the format SummonerName#TAG", ephemeral=True)
-        return
-
     await interaction.response.defer()
+    
+    if "#" not in riot_id:
+        await interaction.followup.send("Invalid Riot ID. Use the format SummonerName#TAG", ephemeral=True)
+        return
 
     # If no discord_user specified, use the command caller
     target_user = discord_user or interaction.user
@@ -1495,13 +1494,13 @@ async def unlink(interaction: discord.Interaction, discord_user: discord.Member 
     app_commands.Choice(name="Unranked", value="unranked")
 ])
 async def lfg(interaction: discord.Interaction, queue_type: app_commands.Choice[str]):
+    await interaction.response.defer()
+    
     # Get the caller's Riot ID from the mapping
     caller_riot_id = await get_riot_id_for_discord(str(interaction.guild.id), str(interaction.user.id))
     if not caller_riot_id:
-        await interaction.response.send_message("You need to link your Discord account to a Riot ID first. Use `/link` to set this up.", ephemeral=True)
+        await interaction.followup.send("You need to link your Discord account to a Riot ID first. Use `/link` to set this up.", ephemeral=True)
         return
-
-    await interaction.response.defer()
 
     # Get all other mapped users from the leaderboard
     mapped_users = await get_all_mapped_players(str(interaction.guild.id))
