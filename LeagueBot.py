@@ -7,7 +7,7 @@ from db import init_db, add_tracked_player, get_tracked_players, remove_tracked_
 from riot_api import (get_account_by_riot_id, get_summoner_rank, get_flex_rank, get_match_history, 
                      get_detailed_match_history, get_champion_mastery, get_specific_champion_mastery, 
                      get_last_played_games, get_role_summary, ensure_match_data_table, 
-                     ensure_puuid_table, cleanup, prefetch_puuids, clear_corrupted_puuid_cache, clear_expired_puuid_cache, clear_expired_match_data_cache, clear_corrupted_match_data_cache, get_champion_data)
+                     ensure_puuid_table, cleanup, prefetch_puuids, clear_corrupted_puuid_cache, clear_expired_puuid_cache, clear_expired_match_data_cache, clear_corrupted_match_data_cache, get_champion_data, get_arena_challenges)
 import asyncio
 from datetime import datetime
 from discord.ui import View, Button
@@ -182,7 +182,8 @@ async def help(interaction: discord.Interaction):
             "`/history` — Show a player's match history\n"
             "`/feederscore` — Calculate feeder score\n"
             "`/rolesummary` — View a player's role distribution\n"
-            "`/firstblood` — Check a player's first blood performance"
+            "`/firstblood` — Check a player's first blood performance\n"
+            "`/arenagod` — Shows the amount of arena games a player has won"
         ),
         inline=False
     )
@@ -1609,6 +1610,62 @@ async def lfg(interaction: discord.Interaction, queue_type: app_commands.Choice[
     except Exception as e:
         print(f"Error sending duo check: {e}")
         await interaction.followup.send("Error sending duo check notification. Please try again.", ephemeral=True)
+
+@bot.tree.command(name="arenagod", description="Show Arena 'Adapt to all Situations' challenge stats for a player.")
+async def arenagod(interaction: discord.Interaction, riot_id: str):
+    await interaction.response.defer()
+    
+    if "#" not in riot_id:
+        await interaction.followup.send("Please use format: GameName#TAG", ephemeral=True)
+        return
+    
+    arena_data = await get_arena_challenges(DEFAULT_REGION, riot_id)
+    
+    if not arena_data:
+        await interaction.followup.send(f"No Arena challenge data found for {riot_id} or they haven't played Arena mode.")
+        return
+    
+    embed = discord.Embed(
+        title=f"Arena God Stats for {riot_id}",
+        description="🔄 **Adapt to All Situations** Challenge",
+        color=discord.Color(0x00FFFF)
+    )
+    
+    embed.add_field(
+        name="Unique 1st Place Champions",
+        value=f"**{arena_data['uniqueChampionWins']}** different champions",
+        inline=True
+    )
+    
+    embed.add_field(
+        name="Challenge Level",
+        value=f"**{arena_data['adaptLevel']}**",
+        inline=True
+    )
+    
+    embed.add_field(
+        name="Percentile",
+        value=f"Top **{arena_data['adaptPercentile']:.1f}%**",
+        inline=True
+    )
+    
+    # Show champion names if available
+    if arena_data.get('championNames'):
+        champ_list = ", ".join(arena_data['championNames'][:10])  # Limit to first 10
+        if len(arena_data['championNames']) > 10:
+            champ_list += f" and {len(arena_data['championNames']) - 10} more"
+        
+        embed.add_field(
+            name="Champions Won With",
+            value=champ_list,
+            inline=False
+        )
+    
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    embed.set_footer(text=f"Last updated: {timestamp}")
+    
+    await interaction.followup.send(embed=embed)
+
 
 @bot.tree.command(name="clear", description="Clears all tracked players from the leaderboard.")
 @app_commands.choices(confirm=[

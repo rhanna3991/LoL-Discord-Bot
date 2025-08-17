@@ -869,3 +869,78 @@ async def clear_corrupted_match_data_cache():
         print(f"Cleared {corrupted} corrupted match_data entries")
     return corrupted
 
+async def get_challenge_by_name(platform: str, puuid: str, name_contains: str):
+    """Get challenge data by searching for a challenge name"""
+    # 1) resolve challenge id by name (platform route!)
+    cfg_url = f"https://{platform}.api.riotgames.com/lol/challenges/v1/challenges/config"
+    pdata_url = f"https://{platform}.api.riotgames.com/lol/challenges/v1/player-data/{puuid}"
+    headers = {"X-Riot-Token": RIOT_API_KEY}
+
+    cfg = await fetch_json(cfg_url, headers)
+    if not cfg:
+        return None
+
+    target_id = None
+    # The config API returns a list directly, not an object with "challenges" key
+    for c in cfg:
+        names = (c.get("localizedNames") or {}).get("en_US") or {}
+        if name_contains.lower() in names.get("name","").lower():
+            target_id = c.get("id") or c.get("challengeId")
+            break
+    if not target_id:
+        return None
+
+    pdata = await fetch_json(pdata_url, headers)
+    if not pdata:
+        return None
+
+    for entry in pdata.get("challenges", []):
+        if entry.get("challengeId") == target_id:
+            return entry  # includes value/level/etc, and sometimes objective ids
+    return None
+
+async def get_arena_challenges(region, riot_id):
+    """Get Arena challenge data for a player using the challenge API"""
+    if "#" not in riot_id:
+        print(f"Invalid Riot ID format: {riot_id}")
+        return None
+    
+    game_name, tag_line = riot_id.split("#", 1)
+    
+    async with aiohttp.ClientSession() as session:
+        # First, get the account to get the PUUID
+        account_data = await get_account_by_riot_id(game_name, tag_line)
+        if not account_data:
+            print(f"Could not find account for {riot_id}")
+            return None
+        
+        puuid = account_data["puuid"]
+        
+        # Get Arena God (total firsts)
+        arena_god = await get_challenge_by_name(region, puuid, "Arena God")
+        total_wins = int(arena_god.get("value", 0)) if arena_god else 0
+        
+        # Get Adapt to All Situations (unique champs with 1st)
+        adapt = await get_challenge_by_name(region, puuid, "Adapt to All Situations")
+        unique_firsts = int(adapt.get("value", 0)) if adapt else 0
+        
+        # If per-champion objective IDs are exposed, map them to names:
+        ids = adapt.get("achievedObjectiveIds", []) if adapt else []
+        id_to_name, _ = await get_champion_data()
+        champ_names = [id_to_name.get(cid, f"Champion {cid}") for cid in ids]
+        
+        if arena_god or adapt:
+            return {
+                "totalWins": total_wins,
+                "uniqueChampionWins": unique_firsts,
+                "championNames": champ_names,
+                "arenaGodLevel": arena_god.get("level", "NONE") if arena_god else "NONE",
+                "arenaGodPercentile": arena_god.get("percentile", 0) if arena_god else 0,
+                "adaptLevel": adapt.get("level", "NONE") if adapt else "NONE",
+                "adaptPercentile": adapt.get("percentile", 0) if adapt else 0
+            }
+        
+        return None
+
+
+
