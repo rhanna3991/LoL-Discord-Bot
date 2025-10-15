@@ -455,12 +455,12 @@ async def get_strongest_player(guild_id):
 async def announce_strongest_player(target, strongest_player, is_interaction=False):
     """Helper function to announce the strongest player to a channel"""
     try:
-        base_image = Image.open('TheStrongest.png')
+        base_image = Image.open('assets/TheStrongest.png')
         img = base_image.copy()
         draw = ImageDraw.Draw(img)
         
         try:
-            font = ImageFont.truetype("MinecraftRegular-Bmg3.otf", 48)
+            font = ImageFont.truetype("assets/MinecraftRegular-Bmg3.otf", 48)
         except:
             try:
                 font = ImageFont.truetype(r"C:\Users\Sewde\Desktop\DiscordBot\MinecraftRegular-Bmg3.otf", 48)
@@ -1603,7 +1603,7 @@ async def lfg(interaction: discord.Interaction, queue_type: app_commands.Choice[
 
     try:
         # Send the image and notification
-        file = discord.File('DuoCheck.png', filename='DuoCheck.png')
+        file = discord.File('assets/DuoCheck.png', filename='DuoCheck.png')
         await interaction.followup.send(content=notification, file=file)
     except FileNotFoundError:
         await interaction.followup.send("⚠️ DuoCheck.png image not found. Please add it to the bot directory.")
