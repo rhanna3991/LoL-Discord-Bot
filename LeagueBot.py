@@ -72,8 +72,8 @@ async def create_hastebin(content):
             "Content-Type": "text/plain"
         }
 
-        # Use a known working mirror that does not require an API key
-        mirror_url = "https://haste.zneix.eu"  # ← You can change this to any other compatible mirror
+        # Using a known working mirror that does not require an API key
+        mirror_url = "https://haste.zneix.eu" 
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
